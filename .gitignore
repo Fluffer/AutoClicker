@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+
+# Packaging output (msix ships as a GitHub Release asset, not in git)
+installer/
+
+# Signing keys — never commit
+*.pfx
+*.snk
+
+# User / IDE
+*.user
+.vs/
