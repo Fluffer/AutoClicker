@@ -27,6 +27,13 @@ fixed point, or run a recorded **sequence of points** with per-point waits.
   *(target-dependent — see notes below)*
 - Global **F6** start/stop hotkey (rebindable F1–F12); tells you if the key is
   already claimed by another app
+- **Esc panic stop** — aborts the run and force-releases every mouse button, in case
+  a hold or drag left one down. Esc is only claimed while a run is active, so it
+  stays usable everywhere else.
+- **Start delay** — count down N seconds before the run begins, so you can focus the
+  target window first
+- **Settings persist** between launches in `%AppData%\AutoClicker\settings.json`,
+  including the last sequence you saved or loaded
 - High-DPI aware, negative (multi-monitor) coordinates supported, custom icon,
   single self-contained build
 

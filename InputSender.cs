@@ -119,6 +119,27 @@ internal static class InputSender
         }
     }
 
+    /// <summary>
+    /// Panic-stop safety net: unconditionally releases all three mouse buttons. A run can be
+    /// aborted while a button is physically down — mid-<see cref="HoldUntil"/>, mid-<see cref="Drag"/>,
+    /// or mid-click — and a stuck button is a system-wide mess the user has to clear by hand.
+    /// Sending an "up" for a button that was never down is harmless, so there is no attempt to
+    /// track which buttons are actually held; unconditional release is the entire point.
+    /// </summary>
+    public static void ReleaseAllButtons()
+    {
+        try
+        {
+            Send(new[] { Mouse(MOUSEEVENTF_LEFTUP), Mouse(MOUSEEVENTF_RIGHTUP), Mouse(MOUSEEVENTF_MIDDLEUP) });
+        }
+        catch (Win32Exception)
+        {
+            // This is the panic path itself: swallowing here is correct, unlike everywhere
+            // else in this file, because a caller relying on the safety net must never see
+            // it throw (SendInput can be blocked by an elevated foreground window).
+        }
+    }
+
     /// <summary>Posts click messages to the window under a screen point; cursor never moves.</summary>
     public static void BackgroundClick(int screenX, int screenY, int button, bool dbl, int holdMs = 0)
     {

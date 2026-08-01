@@ -10,7 +10,10 @@ public partial class Form1 : Form
 {
     private const int HOTKEY_TOGGLE = 0xB001;
     private const int HOTKEY_RECEND = 0xB002;
+    private const int HOTKEY_PANIC = 0xB003;
+    private const string PanicMessage = "Panic stop — all buttons released.";
     private const uint VK_F8 = 0x77;
+    private const uint VK_ESCAPE = 0x1B;
 
     // ---- Controls ----
     private NumericUpDown numHours = null!, numMins = null!, numSecs = null!, numMs = null!;
@@ -27,6 +30,8 @@ public partial class Form1 : Form
     private Button btnUp = null!, btnDown = null!, btnSave = null!, btnLoad = null!;
     private Button btnStart = null!, btnStop = null!, btnHotkey = null!;
     private Label lblStatus = null!;
+    private NumericUpDown numStartDelay = null!;
+    private CheckBox chkPanic = null!;
 
     // ---- State ----
     private List<SeqAction> points = new();
@@ -38,6 +43,11 @@ public partial class Form1 : Form
     private System.Windows.Forms.Timer? pickTimer;
     private int pickCountdown;
     private Action? pickDone;
+    private AppSettings settings = null!;
+    private bool panicKeyRegistered;
+    private bool panicStopped;
+    private System.Windows.Forms.Timer? startDelayTimer;
+    private int startDelayCountdown;
 
     // recording (low-level mouse hook)
     private bool recording;
@@ -46,7 +56,98 @@ public partial class Form1 : Form
 
     public Form1()
     {
+        // Load before BuildUi (called from InitializeComponent): BuildUi bakes hotkeyName
+        // into the Start/Stop captions and the status label, so it must already reflect
+        // the persisted hotkey by the time the controls are built.
+        settings = AppSettings.Load();
+        hotkeyVk = settings.HotkeyVk;
+        hotkeyName = settings.HotkeyName;
+
         InitializeComponent();
+
+        ApplySettings();
+        UpdateEnabled();
+    }
+
+    // ---- Settings persistence ----
+    private void ApplySettings()
+    {
+        numHours.Value = settings.IntervalHours;
+        numMins.Value = settings.IntervalMinutes;
+        numSecs.Value = settings.IntervalSeconds;
+        numMs.Value = settings.IntervalMilliseconds;
+        cmbButton.SelectedIndex = settings.MouseButton;
+        cmbType.SelectedIndex = settings.ClickType;
+        rbRepeatN.Checked = settings.RepeatLimited;
+        rbRepeatUntil.Checked = !settings.RepeatLimited;
+        numRepeat.Value = settings.RepeatCount;
+        rbPick.Checked = settings.UsePickedPosition;
+        rbCurrent.Checked = !settings.UsePickedPosition;
+        numX.Value = settings.PickedX;
+        numY.Value = settings.PickedY;
+        chkSequence.Checked = settings.UseSequence;
+        chkBackground.Checked = settings.BackgroundMode;
+        chkAnchorPoints.Checked = settings.AnchorNewPoints;
+        numJitterPx.Value = settings.JitterPixels;
+        numJitterPct.Value = settings.JitterPercent;
+        numStartDelay.Value = settings.StartDelaySeconds;
+        chkPanic.Checked = settings.PanicKeyEnabled;
+
+        RestoreLastSequence();
+    }
+
+    private void CaptureSettingsFromControls()
+    {
+        settings.IntervalHours = (int)numHours.Value;
+        settings.IntervalMinutes = (int)numMins.Value;
+        settings.IntervalSeconds = (int)numSecs.Value;
+        settings.IntervalMilliseconds = (int)numMs.Value;
+        settings.MouseButton = cmbButton.SelectedIndex;
+        settings.ClickType = cmbType.SelectedIndex;
+        settings.RepeatLimited = rbRepeatN.Checked;
+        settings.RepeatCount = (int)numRepeat.Value;
+        settings.UsePickedPosition = rbPick.Checked;
+        settings.PickedX = (int)numX.Value;
+        settings.PickedY = (int)numY.Value;
+        settings.UseSequence = chkSequence.Checked;
+        settings.BackgroundMode = chkBackground.Checked;
+        settings.AnchorNewPoints = chkAnchorPoints.Checked;
+        settings.JitterPixels = (int)numJitterPx.Value;
+        settings.JitterPercent = (int)numJitterPct.Value;
+        settings.HotkeyVk = hotkeyVk;
+        settings.HotkeyName = hotkeyName;
+        settings.StartDelaySeconds = (int)numStartDelay.Value;
+        settings.PanicKeyEnabled = chkPanic.Checked;
+    }
+
+    // Restores the sequence that was open last time, with no dialog and no user-visible
+    // failure beyond the status line: a missing or corrupt file just means "start empty".
+    private void RestoreLastSequence()
+    {
+        string path = settings.LastSequencePath;
+        if (string.IsNullOrEmpty(path)) return;
+
+        if (!File.Exists(path))
+        {
+            settings.LastSequencePath = "";
+            return;
+        }
+
+        try
+        {
+            var loaded = JsonSerializer.Deserialize<List<SeqAction>>(File.ReadAllText(path));
+            if (loaded == null) throw new JsonException("empty file");
+            foreach (var a in loaded) a.Normalize();
+            points = loaded;
+            RefreshList();
+            chkSequence.Checked = points.Count > 0;
+            lblStatus.Text = $"Restored {points.Count} actions from {Path.GetFileName(path)}.";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            settings.LastSequencePath = "";
+            lblStatus.Text = "Could not restore the last sequence — starting empty.";
+        }
     }
 
     private void BuildUi()
@@ -79,6 +180,7 @@ public partial class Form1 : Form
         root.Controls.Add(BuildOptionsRepeatRow());
         root.Controls.Add(BuildCursorHumanizeRow());
         root.Controls.Add(BuildSequenceGroup());
+        root.Controls.Add(BuildRunOptionsGroup());
         root.Controls.Add(BuildButtonsRow());
 
         btnHotkey = new Button { Text = "Hotkey setting", Dock = DockStyle.Fill, Height = 36, Margin = new Padding(3, 6, 3, 3) };
@@ -295,15 +397,32 @@ public partial class Form1 : Form
         return grp;
     }
 
+    // ===== Start delay + panic key =====
+    private GroupBox BuildRunOptionsGroup()
+    {
+        var grp = NewGroup("Run options");
+        var flow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, WrapContents = false };
+        flow.Controls.Add(Lbl("Start after"));
+        numStartDelay = NewNum(0, 300, 0);
+        flow.Controls.Add(numStartDelay);
+        flow.Controls.Add(Lbl("seconds (0 = immediately)"));
+        chkPanic = new CheckBox { Text = "Esc panic-stops the run", AutoSize = true, Checked = true, Margin = new Padding(18, 6, 3, 3) };
+        flow.Controls.Add(chkPanic);
+        grp.Controls.Add(flow);
+        return grp;
+    }
+
     // ===== Start / Stop =====
     private TableLayoutPanel BuildButtonsRow()
     {
         var row = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 6, 0, 0) };
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        btnStart = new Button { Text = "Start (F6)", Dock = DockStyle.Fill, Height = 50, Font = new Font("Segoe UI", 10F, FontStyle.Bold) };
+        // Captions follow the configured hotkey, which is restored from settings before
+        // BuildUi runs — a hardcoded "F6" here would contradict the status label.
+        btnStart = new Button { Text = $"Start ({hotkeyName})", Dock = DockStyle.Fill, Height = 50, Font = new Font("Segoe UI", 10F, FontStyle.Bold) };
         btnStart.Click += (_, _) => StartClicking();
-        btnStop = new Button { Text = "Stop (F6)", Dock = DockStyle.Fill, Height = 50, Enabled = false, Font = new Font("Segoe UI", 10F, FontStyle.Bold) };
+        btnStop = new Button { Text = $"Stop ({hotkeyName})", Dock = DockStyle.Fill, Height = 50, Enabled = false, Font = new Font("Segoe UI", 10F, FontStyle.Bold) };
         btnStop.Click += (_, _) => StopClicking();
         row.Controls.Add(btnStart, 0, 0);
         row.Controls.Add(btnStop, 1, 0);
@@ -338,7 +457,17 @@ public partial class Form1 : Form
         return c;
     }
 
-    private static Button SeqBtn(string text) => new() { Text = text, Width = 138, Height = 30, Margin = new Padding(2) };
+    // AutoSize rather than a fixed width: at higher DPI scalings a fixed 138 px clipped the
+    // longer captions ("Add cursor pos" rendered as "Add cursor"). MinimumSize keeps the
+    // column of buttons visually even when the captions are short.
+    private static Button SeqBtn(string text) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        MinimumSize = new Size(138, 30),
+        Margin = new Padding(2)
+    };
     private static Label Lbl(string text) => new() { Text = text, AutoSize = true, Margin = new Padding(3, 7, 3, 3) };
 
     private void UpdateEnabled()
@@ -466,6 +595,7 @@ public partial class Form1 : Form
         try
         {
             File.WriteAllText(sfd.FileName, JsonSerializer.Serialize(points, JsonOpts));
+            settings.LastSequencePath = sfd.FileName;
             lblStatus.Text = $"Saved {points.Count} actions to {Path.GetFileName(sfd.FileName)}";
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
@@ -486,6 +616,7 @@ public partial class Form1 : Form
             points = loaded;
             RefreshList();
             chkSequence.Checked = points.Count > 0;
+            settings.LastSequencePath = ofd.FileName;
             lblStatus.Text = $"Loaded {points.Count} actions from {Path.GetFileName(ofd.FileName)}";
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -635,8 +766,32 @@ public partial class Form1 : Form
         RegisterHotkeys();
     }
 
+    // Esc is deliberately NOT registered here alongside F6/F8. RegisterHotKey grabs the key
+    // globally, stealing it from every other app on the machine for as long as this process
+    // is open. That's fine for F6/F8 (uncommon, user-chosen), but Esc is used constantly
+    // elsewhere (closing dialogs, cancelling menus, games). So it is only ever armed for the
+    // duration of an actual run — claimed in StartClicking, released in OnStopped and
+    // OnFormClosing — never at startup.
+    private bool RegisterPanicKey()
+    {
+        if (!chkPanic.Checked) { panicKeyRegistered = false; return true; } // not requested; not a failure
+        panicKeyRegistered = RegisterHotKey(Handle, HOTKEY_PANIC, 0, VK_ESCAPE);
+        return panicKeyRegistered;
+    }
+
+    private void UnregisterPanicKey()
+    {
+        if (!panicKeyRegistered) return;
+        UnregisterHotKey(Handle, HOTKEY_PANIC);
+        panicKeyRegistered = false;
+    }
+
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        // A failed save must not block closing, and there's nowhere useful left to report it.
+        CaptureSettingsFromControls();
+        settings.Save();
+
         running = false;
         if (recording) StopRecording();
 
@@ -645,6 +800,10 @@ public partial class Form1 : Form
         pickTimer = null;
         pickDone = null;
 
+        // Must run before Join below: if a start-delay countdown is pending, `worker` holds
+        // a Thread that was built but never started, and Thread.Join throws on one of those.
+        CancelPendingStartDelay();
+
         // Wait for the worker to unwind. The worker is a background thread, so without this
         // the process can exit mid-"hold" and leave the mouse button physically stuck down.
         // It polls `running` every <= 20 ms, so this returns almost immediately.
@@ -652,6 +811,7 @@ public partial class Form1 : Form
 
         UnregisterHotKey(Handle, HOTKEY_TOGGLE);
         UnregisterHotKey(Handle, HOTKEY_RECEND);
+        UnregisterPanicKey();
         base.OnFormClosing(e);
     }
 
@@ -669,6 +829,15 @@ public partial class Form1 : Form
             if (id == HOTKEY_RECEND)
             {
                 if (recording) StopRecording();
+                return;
+            }
+            if (id == HOTKEY_PANIC)
+            {
+                panicStopped = true;
+                CancelPendingStartDelay();
+                running = false;
+                InputSender.ReleaseAllButtons();
+                lblStatus.Text = PanicMessage;
                 return;
             }
         }
@@ -720,24 +889,36 @@ public partial class Form1 : Form
         // Claim the engine. `running` alone is not enough: after Stop, the previous worker
         // is still unwinding and its finally-block sets running = false — which would
         // immediately kill a run started in that window. busy is only released by Finish(),
-        // once the old worker is genuinely done.
+        // once the old worker is genuinely done — or, if the run never leaves its start-delay
+        // countdown, by CancelPendingStartDelay instead (Finish() never runs for that thread).
         if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
 
+        panicStopped = false;
         bool seq = chkSequence.Checked && points.Count > 0;
         bool limited = rbRepeatN.Checked;
         int limit = (int)numRepeat.Value;
         int jitterPx = (int)numJitterPx.Value;
         int jitterPct = (int)numJitterPct.Value;
+        int delaySeconds = (int)numStartDelay.Value;
 
         running = true;
         btnStart.Enabled = false;
         btnStop.Enabled = true;
 
+        bool panicArmed = RegisterPanicKey();
+        string panicWarn = chkPanic.Checked && !panicArmed
+            ? " Esc is already claimed by another app — panic key OFF."
+            : "";
+
+        // Build the thread now, capturing every run parameter at the moment Start was
+        // pressed — not after a delay elapses — so nothing the user changes mid-countdown
+        // can silently alter the run that was actually requested.
+        string runDescription;
         if (seq)
         {
             bool bg = chkBackground.Checked;
             var acts = points.Select(p => p.Clone()).ToList();
-            lblStatus.Text = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
+            runDescription = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
             worker = new Thread(() => RunSequence(acts, bg, limited, limit, jitterPx, jitterPct)) { IsBackground = true };
         }
         else
@@ -748,22 +929,68 @@ public partial class Form1 : Form
             int px = (int)numX.Value, py = (int)numY.Value;
             int interval = IntervalMs();
             int button = cmbButton.SelectedIndex;
-            lblStatus.Text = hold ? $"Holding {cmbButton.Text} button... press {hotkeyName} to stop."
+            runDescription = hold ? $"Holding {cmbButton.Text} button... press {hotkeyName} to stop."
                                   : $"Clicking... press {hotkeyName} to stop.";
             worker = new Thread(() => RunSingle(hold, dbl, button, useFixedPos, px, py, interval, limited && !hold, limit, jitterPx, jitterPct)) { IsBackground = true };
         }
 
+        if (delaySeconds <= 0)
+        {
+            lblStatus.Text = runDescription + panicWarn;
+            StartWorkerThread();
+            return;
+        }
+
+        startDelayCountdown = delaySeconds;
+        startDelayTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        lblStatus.Text = $"Starting in {startDelayCountdown} s... press {hotkeyName} or Esc to cancel.{panicWarn}";
+        startDelayTimer.Tick += (_, _) =>
+        {
+            startDelayCountdown--;
+            if (startDelayCountdown > 0)
+            {
+                lblStatus.Text = $"Starting in {startDelayCountdown} s... press {hotkeyName} or Esc to cancel.{panicWarn}";
+                return;
+            }
+            startDelayTimer!.Stop();
+            startDelayTimer.Dispose();
+            startDelayTimer = null;
+            lblStatus.Text = runDescription + panicWarn;
+            StartWorkerThread();
+        };
+        startDelayTimer.Start();
+    }
+
+    private void StartWorkerThread()
+    {
         try
         {
-            worker.Start();
+            worker!.Start();
         }
         catch (Exception ex)
         {
             running = false;
+            worker = null;
+            UnregisterPanicKey();
             Interlocked.Exchange(ref busy, 0);
             OnStopped();
             lblStatus.Text = "Could not start: " + ex.Message;
         }
+    }
+
+    // Cancels a pending start-delay countdown, if any. The thread built in StartClicking
+    // was never started in that case, so Finish() will never run for it — this is the only
+    // path that releases `busy` and restores the UI for a countdown that never went live.
+    private bool CancelPendingStartDelay()
+    {
+        if (startDelayTimer == null) return false;
+        startDelayTimer.Stop();
+        startDelayTimer.Dispose();
+        startDelayTimer = null;
+        worker = null; // discard the never-started thread
+        Interlocked.Exchange(ref busy, 0);
+        OnStopped();
+        return true;
     }
 
     private void RunSingle(bool hold, bool dbl, int button, bool useFixedPos, int px, int py, int interval, bool limited, int limit, int jitterPx, int jitterPct)
@@ -923,12 +1150,19 @@ public partial class Form1 : Form
         Interlocked.Exchange(ref busy, 0);
     }
 
-    private void StopClicking() => running = false;
+    private void StopClicking()
+    {
+        running = false;
+        CancelPendingStartDelay();
+    }
 
     private void OnStopped()
     {
+        UnregisterPanicKey();
         btnStart.Enabled = true;
         btnStop.Enabled = false;
-        lblStatus.Text = $"Stopped. Press {hotkeyName} to start.";
+        // Confirming the buttons were force-released is the whole point of the panic key,
+        // so don't let the worker's own async "Stopped" message land on top of that.
+        lblStatus.Text = panicStopped ? PanicMessage : $"Stopped. Press {hotkeyName} to start.";
     }
 }
