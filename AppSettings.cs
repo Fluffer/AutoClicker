@@ -40,7 +40,16 @@ public sealed class AppSettings
 
     public int StartDelaySeconds { get; set; }
     public bool PanicKeyEnabled { get; set; } = true;
+
+    /// <summary>Minimising hides to the tray instead of the taskbar.</summary>
+    public bool MinimizeToTray { get; set; }
     public string LastSequencePath { get; set; } = "";
+
+    /// <summary>Name of the selected profile; "" means none selected (use the ad-hoc sequence).</summary>
+    public string ActiveProfileName { get; set; } = "";
+
+    /// <summary>False keeps today's single-sequence behavior; true switches to named profiles.</summary>
+    public bool UseProfiles { get; set; }
 
     private const uint MinFunctionKeyVk = 0x70; // F1
     private const uint MaxFunctionKeyVk = 0x7B; // F12
@@ -117,6 +126,7 @@ public sealed class AppSettings
 
         HotkeyName ??= "";
         LastSequencePath ??= "";
+        ActiveProfileName ??= "";
 
         if (HotkeyVk < MinFunctionKeyVk || HotkeyVk > MaxFunctionKeyVk)
         {

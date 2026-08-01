@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -11,6 +10,9 @@ public partial class Form1 : Form
     private const int HOTKEY_TOGGLE = 0xB001;
     private const int HOTKEY_RECEND = 0xB002;
     private const int HOTKEY_PANIC = 0xB003;
+    // Per-profile hotkey ids start well clear of the three fixed ids above so a profile
+    // can never collide with the toggle/end-recording/panic hotkeys by id.
+    private const int ProfileHotkeyIdBase = 0xB010;
     private const string PanicMessage = "Panic stop — all buttons released.";
     private const uint VK_F8 = 0x77;
     private const uint VK_ESCAPE = 0x1B;
@@ -32,8 +34,20 @@ public partial class Form1 : Form
     private Label lblStatus = null!;
     private NumericUpDown numStartDelay = null!;
     private CheckBox chkPanic = null!;
+    private CheckBox chkMinimizeToTray = null!;
+
+    // ---- Profiles ----
+    private CheckBox chkUseProfiles = null!;
+    private ComboBox cmbProfile = null!, cmbProfileHotkey = null!;
+    private Button btnProfileNew = null!, btnProfileRename = null!, btnProfileDuplicate = null!, btnProfileDelete = null!, btnProfileSave = null!;
+
+    // ---- Tray icon ----
+    private NotifyIcon trayIcon = null!;
+    private ContextMenuStrip trayMenu = null!;
+    private ToolStripMenuItem miShowHide = null!, miStart = null!, miStop = null!, miExit = null!;
 
     // ---- State ----
+    private readonly SequenceRunner runner;
     private List<SeqAction> points = new();
     private Thread? worker;
     private volatile bool running;
@@ -49,6 +63,18 @@ public partial class Form1 : Form
     private System.Windows.Forms.Timer? startDelayTimer;
     private int startDelayCountdown;
 
+    // Named, hotkey-switchable sequences. Empty by default: existing users have no
+    // profiles.json yet, and chkUseProfiles defaults to off, so this never changes
+    // behavior until the user opts in.
+    private List<Profile> profiles = new();
+    // Index into `profiles` of the profile currently loaded into `points`; -1 = none.
+    private int activeProfileIndex = -1;
+    // Guards programmatic ComboBox/CheckBox updates (restoring settings, refreshing the
+    // profile list after New/Rename/Duplicate/Delete) from re-entering the same handlers
+    // that respond to the user's own selections.
+    private bool suppressProfileEvents;
+    private readonly List<int> registeredProfileHotkeyIds = new();
+
     // recording (low-level mouse hook)
     private bool recording;
     private IntPtr mouseHook = IntPtr.Zero;
@@ -62,6 +88,7 @@ public partial class Form1 : Form
         settings = AppSettings.Load();
         hotkeyVk = settings.HotkeyVk;
         hotkeyName = settings.HotkeyName;
+        runner = new SequenceRunner(KeepGoing, OnRunnerStep, OnRunnerStepStarting);
 
         InitializeComponent();
 
@@ -92,8 +119,10 @@ public partial class Form1 : Form
         numJitterPct.Value = settings.JitterPercent;
         numStartDelay.Value = settings.StartDelaySeconds;
         chkPanic.Checked = settings.PanicKeyEnabled;
+        chkMinimizeToTray.Checked = settings.MinimizeToTray;
 
         RestoreLastSequence();
+        RestoreProfiles();
     }
 
     private void CaptureSettingsFromControls()
@@ -118,6 +147,17 @@ public partial class Form1 : Form
         settings.HotkeyName = hotkeyName;
         settings.StartDelaySeconds = (int)numStartDelay.Value;
         settings.PanicKeyEnabled = chkPanic.Checked;
+        settings.MinimizeToTray = chkMinimizeToTray.Checked;
+
+        settings.UseProfiles = chkUseProfiles.Checked;
+        // ActiveProfileName is kept in sync as profiles are switched, created, renamed or
+        // deleted; re-assert it here too and persist whatever is currently on screen, so
+        // closing the app while mid-edit on a profile never silently discards that edit.
+        if (chkUseProfiles.Checked && activeProfileIndex >= 0 && activeProfileIndex < profiles.Count)
+        {
+            settings.ActiveProfileName = profiles[activeProfileIndex].Name;
+            SaveCurrentPointsToProfile(activeProfileIndex);
+        }
     }
 
     // Restores the sequence that was open last time, with no dialog and no user-visible
@@ -156,6 +196,7 @@ public partial class Form1 : Form
         try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); }
         catch (ArgumentException) { }
         catch (IOException) { }
+        BuildTrayIcon(); // depends on Icon/Text already being set above
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -180,6 +221,7 @@ public partial class Form1 : Form
         root.Controls.Add(BuildOptionsRepeatRow());
         root.Controls.Add(BuildCursorHumanizeRow());
         root.Controls.Add(BuildSequenceGroup());
+        root.Controls.Add(BuildProfilesGroup());
         root.Controls.Add(BuildRunOptionsGroup());
         root.Controls.Add(BuildButtonsRow());
 
@@ -397,6 +439,52 @@ public partial class Form1 : Form
         return grp;
     }
 
+    // ===== Profiles (named, switchable sequences) =====
+    private GroupBox BuildProfilesGroup()
+    {
+        var grp = NewGroup("Profiles (switch between several named sequences)");
+        var t = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, Dock = DockStyle.Fill };
+
+        chkUseProfiles = new CheckBox { Text = "Use profiles", AutoSize = true, Margin = new Padding(3, 3, 3, 6) };
+        chkUseProfiles.CheckedChanged += (_, _) => OnUseProfilesChanged();
+        t.Controls.Add(chkUseProfiles);
+
+        var row = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        row.Controls.Add(Lbl("Profile:"));
+        cmbProfile = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, Margin = new Padding(3, 4, 12, 3) };
+        cmbProfile.SelectedIndexChanged += CmbProfile_SelectedIndexChanged;
+        row.Controls.Add(cmbProfile);
+
+        btnProfileNew = SeqBtn("New");
+        btnProfileNew.Click += (_, _) => NewProfile();
+        btnProfileRename = SeqBtn("Rename");
+        btnProfileRename.Click += (_, _) => RenameProfile();
+        btnProfileDuplicate = SeqBtn("Duplicate");
+        btnProfileDuplicate.Click += (_, _) => DuplicateProfile();
+        btnProfileDelete = SeqBtn("Delete");
+        btnProfileDelete.Click += (_, _) => DeleteProfile();
+        btnProfileSave = SeqBtn("Save to profile");
+        btnProfileSave.Click += (_, _) => SaveToProfile();
+        row.Controls.Add(btnProfileNew);
+        row.Controls.Add(btnProfileRename);
+        row.Controls.Add(btnProfileDuplicate);
+        row.Controls.Add(btnProfileDelete);
+        row.Controls.Add(btnProfileSave);
+        t.Controls.Add(row);
+
+        var hkRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0, 3, 0, 0) };
+        hkRow.Controls.Add(Lbl("Profile hotkey:"));
+        cmbProfileHotkey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100, Margin = new Padding(3, 4, 3, 3) };
+        cmbProfileHotkey.Items.Add("None");
+        for (int i = 1; i <= 12; i++) cmbProfileHotkey.Items.Add("F" + i);
+        cmbProfileHotkey.SelectedIndexChanged += CmbProfileHotkey_SelectedIndexChanged;
+        hkRow.Controls.Add(cmbProfileHotkey);
+        t.Controls.Add(hkRow);
+
+        grp.Controls.Add(t);
+        return grp;
+    }
+
     // ===== Start delay + panic key =====
     private GroupBox BuildRunOptionsGroup()
     {
@@ -408,8 +496,65 @@ public partial class Form1 : Form
         flow.Controls.Add(Lbl("seconds (0 = immediately)"));
         chkPanic = new CheckBox { Text = "Esc panic-stops the run", AutoSize = true, Checked = true, Margin = new Padding(18, 6, 3, 3) };
         flow.Controls.Add(chkPanic);
+        // Not persisted: AppSettings.cs is owned elsewhere this session, so this checkbox
+        // only holds its value in memory for the life of the process.
+        chkMinimizeToTray = new CheckBox { Text = "Minimize to tray", AutoSize = true, Margin = new Padding(18, 6, 3, 3) };
+        flow.Controls.Add(chkMinimizeToTray);
         grp.Controls.Add(flow);
         return grp;
+    }
+
+    // ===== System tray =====
+    private void BuildTrayIcon()
+    {
+        trayMenu = new ContextMenuStrip();
+        miShowHide = new ToolStripMenuItem("Show/Hide");
+        miShowHide.Click += (_, _) => { if (Visible) HideToTray(); else RestoreFromTray(); };
+        miStart = new ToolStripMenuItem("Start", null, (_, _) => StartClicking());
+        miStop = new ToolStripMenuItem("Stop", null, (_, _) => StopClicking()) { Enabled = false };
+        // Routed through Close(), not Environment.Exit: Close() runs OnFormClosing, which is
+        // what saves settings and joins the worker thread. Environment.Exit would skip both.
+        miExit = new ToolStripMenuItem("Exit", null, (_, _) => Close());
+        trayMenu.Items.Add(miShowHide);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add(miStart);
+        trayMenu.Items.Add(miStop);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add(miExit);
+
+        trayIcon = new NotifyIcon
+        {
+            Icon = Icon,
+            Text = Text,
+            ContextMenuStrip = trayMenu,
+            Visible = true
+        };
+        trayIcon.DoubleClick += (_, _) => RestoreFromTray();
+    }
+
+    private void HideToTray()
+    {
+        Hide();
+        ShowInTaskbar = false;
+    }
+
+    private void RestoreFromTray()
+    {
+        ShowInTaskbar = true;
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    // Minimizing normally just minimizes to the taskbar; only route to the tray when the
+    // user has opted in via chkMinimizeToTray. Guarded with `is { }` rather than a plain
+    // null-check because AutoSize layout can fire Resize events while BuildUi is still
+    // constructing controls, before the checkbox field is assigned.
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (WindowState == FormWindowState.Minimized && chkMinimizeToTray is { Checked: true })
+            HideToTray();
     }
 
     // ===== Start / Stop =====
@@ -764,6 +909,11 @@ public partial class Form1 : Form
     {
         base.OnHandleCreated(e);
         RegisterHotkeys();
+        // Registers any profile hotkeys restored from settings. Deferred to here (rather
+        // than called directly from RestoreProfiles during the constructor) for the same
+        // reason RegisterHotkeys() is: RegisterHotKey needs a real HWND, and this is the
+        // first point one is guaranteed to exist.
+        RegisterProfileHotkeys();
     }
 
     // Esc is deliberately NOT registered here alongside F6/F8. RegisterHotKey grabs the key
@@ -784,6 +934,393 @@ public partial class Form1 : Form
         if (!panicKeyRegistered) return;
         UnregisterHotKey(Handle, HOTKEY_PANIC);
         panicKeyRegistered = false;
+    }
+
+    // ---- Profiles ----
+
+    // Restores profiles.json and whichever profile (if any) was active last session,
+    // without letting the combo box / checkbox events fire mid-restore against state
+    // that isn't fully loaded yet. Hotkey registration is deliberately left to
+    // OnHandleCreated — see the comment there.
+    private void RestoreProfiles()
+    {
+        profiles = ProfileStore.Load();
+
+        suppressProfileEvents = true;
+        try
+        {
+            cmbProfile.Items.Clear();
+            foreach (Profile p in profiles) cmbProfile.Items.Add(p.Name);
+
+            chkUseProfiles.Checked = settings.UseProfiles;
+
+            activeProfileIndex = -1;
+            if (profiles.Count > 0)
+            {
+                int idx = profiles.FindIndex(p => p.Name == settings.ActiveProfileName);
+                if (idx < 0) idx = 0;
+                cmbProfile.SelectedIndex = idx;
+                activeProfileIndex = idx;
+            }
+        }
+        finally { suppressProfileEvents = false; }
+
+        // Only load the profile's actions over `points` when profiles are actually in use —
+        // otherwise RestoreLastSequence's ad-hoc sequence (already loaded above) must stand.
+        if (settings.UseProfiles && activeProfileIndex >= 0)
+            LoadProfileIntoPoints(profiles[activeProfileIndex]);
+
+        UpdateProfileHotkeyCombo();
+        UpdateProfileControlsEnabled();
+    }
+
+    // Repopulates the combo box from `profiles`, optionally re-selecting a profile by name
+    // (its index may have shifted). Suppressed so this never re-triggers the switch logic.
+    private void RefreshProfileCombo(string? selectName)
+    {
+        suppressProfileEvents = true;
+        try
+        {
+            cmbProfile.Items.Clear();
+            foreach (Profile p in profiles) cmbProfile.Items.Add(p.Name);
+            if (selectName != null)
+            {
+                int idx = profiles.FindIndex(p => p.Name == selectName);
+                if (idx >= 0) cmbProfile.SelectedIndex = idx;
+            }
+        }
+        finally { suppressProfileEvents = false; }
+    }
+
+    private void LoadProfileIntoPoints(Profile p)
+    {
+        points = p.Actions.Select(a => a.Clone()).ToList();
+        RefreshList();
+        chkSequence.Checked = points.Count > 0;
+    }
+
+    private void SaveCurrentPointsToProfile(int index)
+    {
+        if (index < 0 || index >= profiles.Count) return;
+        profiles[index].Actions = points.Select(a => a.Clone()).ToList();
+        ProfileStore.Save(profiles);
+    }
+
+    private void CmbProfile_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (suppressProfileEvents) return;
+        SwitchToProfile(cmbProfile.SelectedIndex);
+    }
+
+    // Auto-saves the outgoing profile's current edits before loading the new one, so
+    // switching profiles can never silently discard a recorded sequence — the worst
+    // outcome this feature could produce. Chosen over a confirm/discard prompt because a
+    // profile switch is meant to be a quick, frequent action (that's the point of having
+    // several), and a prompt on every switch would defeat that.
+    private void SwitchToProfile(int newIndex)
+    {
+        if (newIndex == activeProfileIndex) return;
+        if (activeProfileIndex >= 0 && activeProfileIndex < profiles.Count)
+            SaveCurrentPointsToProfile(activeProfileIndex);
+
+        activeProfileIndex = newIndex;
+        if (newIndex >= 0 && newIndex < profiles.Count)
+        {
+            LoadProfileIntoPoints(profiles[newIndex]);
+            settings.ActiveProfileName = profiles[newIndex].Name;
+            lblStatus.Text = $"Switched to profile \"{profiles[newIndex].Name}\".";
+        }
+
+        UpdateProfileHotkeyCombo();
+    }
+
+    private void NewProfile()
+    {
+        string? name = PromptForName("New profile", "Profile name:", "");
+        if (name == null) return;
+
+        // The outgoing profile's edits would otherwise vanish the moment the new, empty
+        // profile takes over `points` — same reasoning as SwitchToProfile.
+        if (activeProfileIndex >= 0) SaveCurrentPointsToProfile(activeProfileIndex);
+
+        string unique = ProfileStore.UniqueName(profiles, string.IsNullOrWhiteSpace(name) ? "Profile" : name.Trim());
+        var p = new Profile { Name = unique };
+        profiles.Add(p);
+        ProfileStore.Save(profiles);
+
+        activeProfileIndex = profiles.Count - 1;
+        RefreshProfileCombo(unique);
+        LoadProfileIntoPoints(p);
+        settings.ActiveProfileName = unique;
+
+        UpdateProfileHotkeyCombo();
+        UpdateProfileControlsEnabled();
+        RegisterProfileHotkeys();
+        lblStatus.Text = $"Created profile \"{unique}\".";
+    }
+
+    private void RenameProfile()
+    {
+        if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count) return;
+        Profile p = profiles[activeProfileIndex];
+        string? name = PromptForName("Rename profile", "Profile name:", p.Name);
+        if (name == null) return;
+
+        string desired = string.IsNullOrWhiteSpace(name) ? p.Name : name.Trim();
+        string unique = ProfileStore.UniqueName(profiles.Where(x => x != p), desired);
+        p.Name = unique;
+        ProfileStore.Save(profiles);
+
+        settings.ActiveProfileName = unique;
+        RefreshProfileCombo(unique);
+        lblStatus.Text = $"Renamed to \"{unique}\".";
+    }
+
+    private void DuplicateProfile()
+    {
+        if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count) return;
+
+        // Persist any in-progress edits into the source profile first, so the duplicate
+        // reflects what's on screen rather than a stale on-disk copy.
+        SaveCurrentPointsToProfile(activeProfileIndex);
+
+        Profile source = profiles[activeProfileIndex];
+        string unique = ProfileStore.UniqueName(profiles, source.Name + " (copy)");
+        var copy = new Profile { Name = unique, Actions = source.Actions.Select(a => a.Clone()).ToList() };
+        profiles.Add(copy);
+        ProfileStore.Save(profiles);
+
+        activeProfileIndex = profiles.Count - 1;
+        RefreshProfileCombo(unique);
+        LoadProfileIntoPoints(copy);
+        settings.ActiveProfileName = unique;
+
+        UpdateProfileHotkeyCombo();
+        UpdateProfileControlsEnabled();
+        lblStatus.Text = $"Duplicated \"{source.Name}\" as \"{unique}\".";
+    }
+
+    private void DeleteProfile()
+    {
+        if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count) return;
+        Profile p = profiles[activeProfileIndex];
+
+        DialogResult result = MessageBox.Show(this,
+            $"Delete profile \"{p.Name}\"? This permanently removes its saved sequence.",
+            "Delete profile", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (result != DialogResult.Yes) return;
+
+        profiles.RemoveAt(activeProfileIndex);
+        ProfileStore.Save(profiles);
+        activeProfileIndex = -1; // the deleted index no longer refers to anything
+
+        string? nextName = profiles.Count > 0 ? profiles[0].Name : null;
+        RefreshProfileCombo(nextName);
+
+        if (nextName != null)
+        {
+            activeProfileIndex = 0;
+            LoadProfileIntoPoints(profiles[0]);
+            settings.ActiveProfileName = profiles[0].Name;
+        }
+        else
+        {
+            points.Clear();
+            RefreshList();
+            settings.ActiveProfileName = "";
+        }
+
+        UpdateProfileHotkeyCombo();
+        UpdateProfileControlsEnabled();
+        RegisterProfileHotkeys();
+        lblStatus.Text = $"Deleted profile \"{p.Name}\".";
+    }
+
+    private void SaveToProfile()
+    {
+        if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count)
+        {
+            lblStatus.Text = "Select a profile first.";
+            return;
+        }
+        SaveCurrentPointsToProfile(activeProfileIndex);
+        lblStatus.Text = $"Saved {points.Count} actions to \"{profiles[activeProfileIndex].Name}\".";
+    }
+
+    private void UpdateProfileHotkeyCombo()
+    {
+        suppressProfileEvents = true;
+        try
+        {
+            if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count)
+            {
+                cmbProfileHotkey.SelectedIndex = 0; // "None"
+                return;
+            }
+            uint vk = profiles[activeProfileIndex].HotkeyVk;
+            cmbProfileHotkey.SelectedIndex = vk == 0 ? 0 : (int)(vk - 0x70 + 1);
+        }
+        finally { suppressProfileEvents = false; }
+    }
+
+    private void CmbProfileHotkey_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (suppressProfileEvents) return;
+        if (activeProfileIndex < 0 || activeProfileIndex >= profiles.Count) return;
+
+        int sel = cmbProfileHotkey.SelectedIndex; // 0 = None, 1..12 = F1..F12
+        uint vk = sel <= 0 ? 0u : (uint)(0x70 + (sel - 1));
+
+        // Reject a collision with the main start/stop hotkey or F8 (ends recording): either
+        // one would otherwise silently never fire once claimed here, or break recording.
+        if (vk != 0 && (vk == hotkeyVk || vk == VK_F8))
+        {
+            lblStatus.Text = vk == hotkeyVk
+                ? $"F{sel} is already the start/stop hotkey — pick a different key."
+                : $"F{sel} is reserved for ending recording — pick a different key.";
+            UpdateProfileHotkeyCombo(); // revert to the profile's actual (unchanged) hotkey
+            return;
+        }
+
+        // Reject a collision with another profile's hotkey too — first-claimed wins, same
+        // rule ProfileStore.Load() already applies to a hand-edited profiles.json.
+        if (vk != 0)
+        {
+            for (int i = 0; i < profiles.Count; i++)
+            {
+                if (i == activeProfileIndex || profiles[i].HotkeyVk != vk) continue;
+                lblStatus.Text = $"F{sel} is already assigned to profile \"{profiles[i].Name}\" — pick a different key.";
+                UpdateProfileHotkeyCombo();
+                return;
+            }
+        }
+
+        Profile p = profiles[activeProfileIndex];
+        p.HotkeyVk = vk;
+        p.HotkeyName = vk == 0 ? "" : "F" + sel;
+        ProfileStore.Save(profiles);
+        RegisterProfileHotkeys();
+        lblStatus.Text = vk == 0 ? $"Removed hotkey from \"{p.Name}\"." : $"\"{p.Name}\" now runs on F{sel}.";
+    }
+
+    private void OnUseProfilesChanged()
+    {
+        settings.UseProfiles = chkUseProfiles.Checked;
+        if (chkUseProfiles.Checked)
+        {
+            if (activeProfileIndex >= 0 && activeProfileIndex < profiles.Count)
+            {
+                LoadProfileIntoPoints(profiles[activeProfileIndex]);
+                lblStatus.Text = $"Using profile \"{profiles[activeProfileIndex].Name}\".";
+            }
+            else
+            {
+                lblStatus.Text = "No profiles yet — click New to create one.";
+            }
+            RegisterProfileHotkeys();
+        }
+        else
+        {
+            // Save whatever is on screen back to the active profile before returning to the
+            // single ad-hoc sequence, then fall back to exactly the pre-profiles behavior.
+            if (activeProfileIndex >= 0 && activeProfileIndex < profiles.Count)
+                SaveCurrentPointsToProfile(activeProfileIndex);
+            UnregisterProfileHotkeys();
+            RestoreLastSequence();
+        }
+
+        UpdateProfileControlsEnabled();
+    }
+
+    private void UpdateProfileControlsEnabled()
+    {
+        bool on = chkUseProfiles.Checked;
+        bool hasSelection = on && activeProfileIndex >= 0 && activeProfileIndex < profiles.Count;
+        cmbProfile.Enabled = on && profiles.Count > 0;
+        btnProfileNew.Enabled = on;
+        btnProfileRename.Enabled = hasSelection;
+        btnProfileDuplicate.Enabled = hasSelection;
+        btnProfileDelete.Enabled = hasSelection;
+        btnProfileSave.Enabled = hasSelection;
+        cmbProfileHotkey.Enabled = hasSelection;
+    }
+
+    // Registers one global hotkey per profile that has one assigned, using ids
+    // ProfileHotkeyIdBase + index so they can never collide with HOTKEY_TOGGLE/RECEND/PANIC.
+    // Always unregisters everything currently held first: the profile count and hotkey
+    // assignments can both change between calls (New/Rename/Duplicate/Delete/hotkey edit),
+    // and a stale registration would otherwise keep claiming a key globally forever — the
+    // same leak RegisterHotKey risks everywhere else it's used in this form.
+    private void RegisterProfileHotkeys()
+    {
+        UnregisterProfileHotkeys();
+        if (lblStatus is null) return; // the handle can be created before BuildUi finishes
+        if (!chkUseProfiles.Checked) return;
+
+        for (int i = 0; i < profiles.Count; i++)
+        {
+            uint vk = profiles[i].HotkeyVk;
+            if (vk == 0) continue;
+            // A collision with the main hotkey or F8 is already rejected at assignment time
+            // (CmbProfileHotkey_SelectedIndexChanged), so reaching here with one is only
+            // possible via a hand-edited profiles.json — skip it rather than register
+            // something that would silently steal F6/F8 from the rest of the app.
+            if (vk == hotkeyVk || vk == VK_F8) continue;
+
+            int id = ProfileHotkeyIdBase + i;
+            if (RegisterHotKey(Handle, id, 0, vk))
+                registeredProfileHotkeyIds.Add(id);
+            else
+                lblStatus.Text = $"{profiles[i].HotkeyName} is already claimed by another app — \"{profiles[i].Name}\" hotkey OFF.";
+        }
+    }
+
+    private void UnregisterProfileHotkeys()
+    {
+        foreach (int id in registeredProfileHotkeyIds) UnregisterHotKey(Handle, id);
+        registeredProfileHotkeyIds.Clear();
+    }
+
+    // Minimal modal text-entry dialog, styled like the hotkey-setting dialog above: this
+    // keeps Profiles from needing a new dialog abstraction for what's otherwise a single
+    // TextBox + OK/Cancel.
+    private string? PromptForName(string title, string prompt, string initialValue)
+    {
+        using var dlg = new Form
+        {
+            Text = title,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(320, 120),
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+        var lbl = new Label { Text = prompt, Location = new Point(16, 20), AutoSize = true };
+        var txt = new TextBox { Location = new Point(16, 44), Width = 288, Text = initialValue };
+        var ok = new Button { Text = "OK", Location = new Point(140, 76), Size = new Size(75, 32), DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Location = new Point(223, 76), Size = new Size(82, 32), DialogResult = DialogResult.Cancel };
+        dlg.Controls.AddRange(new Control[] { lbl, txt, ok, cancel });
+        dlg.AcceptButton = ok; dlg.CancelButton = cancel;
+        txt.SelectAll();
+
+        return dlg.ShowDialog(this) == DialogResult.OK ? txt.Text : null;
+    }
+
+    // Pressing a profile hotkey both selects that profile and starts it, routed through the
+    // same StartClicking() the toolbar Start button and main hotkey use, so the busy claim,
+    // start-delay countdown and panic-key registration all still apply — a profile hotkey
+    // is not a shortcut around them.
+    private void HandleProfileHotkey(int index)
+    {
+        if (index < 0 || index >= profiles.Count) return;
+
+        SwitchToProfile(index);
+        suppressProfileEvents = true;
+        try { cmbProfile.SelectedIndex = index; }
+        finally { suppressProfileEvents = false; }
+        UpdateProfileHotkeyCombo();
+
+        StartClicking();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -812,6 +1349,13 @@ public partial class Form1 : Form
         UnregisterHotKey(Handle, HOTKEY_TOGGLE);
         UnregisterHotKey(Handle, HOTKEY_RECEND);
         UnregisterPanicKey();
+        UnregisterProfileHotkeys();
+
+        // Visible = false first, then Dispose: without this a ghost icon lingers in the
+        // tray until the user happens to hover over its old location.
+        trayIcon.Visible = false;
+        trayIcon.Dispose();
+
         base.OnFormClosing(e);
     }
 
@@ -840,6 +1384,12 @@ public partial class Form1 : Form
                 lblStatus.Text = PanicMessage;
                 return;
             }
+            if (id >= ProfileHotkeyIdBase && id < ProfileHotkeyIdBase + profiles.Count)
+            {
+                if (recording) { StopRecording(); return; }
+                HandleProfileHotkey(id - ProfileHotkeyIdBase);
+                return;
+            }
         }
         base.WndProc(ref m);
     }
@@ -853,34 +1403,6 @@ public partial class Form1 : Form
                 + (long)numMs.Value;
         return (int)Math.Min(ms, int.MaxValue);
     }
-
-    // Waits `ms`, but bails out early once `running` goes false.
-    // Measured against a Stopwatch rather than by accumulating fixed steps: the old
-    // "sleep 25 ms until you've slept enough" loop overshot every interval that wasn't
-    // a multiple of 25 (a 30 ms interval actually waited 50 ms).
-    private void InterruptibleSleep(int ms)
-    {
-        if (ms <= 0) return; // 0 means "as fast as possible", not "sleep a tick"
-        var sw = Stopwatch.StartNew();
-        while (running)
-        {
-            long left = ms - sw.ElapsedMilliseconds;
-            if (left <= 0) return;
-            if (left > 20) Thread.Sleep(10);   // coarse; keeps stop latency <= 10 ms
-            else if (left > 2) Thread.Sleep(1);
-            else Thread.SpinWait(100);         // final approach, Sleep is too granular here
-        }
-    }
-
-    // ---- Humanize ----
-    private static int JitterMs(int ms, int percent)
-    {
-        if (ms <= 0 || percent <= 0) return ms;
-        double factor = 1 + ((Random.Shared.NextDouble() * 2) - 1) * percent / 100.0;
-        return (int)Math.Max(0, Math.Round(ms * factor));
-    }
-
-    private static int JitterPx(int maxPx) => maxPx <= 0 ? 0 : Random.Shared.Next(-maxPx, maxPx + 1);
 
     private void StartClicking()
     {
@@ -902,8 +1424,7 @@ public partial class Form1 : Form
         int delaySeconds = (int)numStartDelay.Value;
 
         running = true;
-        btnStart.Enabled = false;
-        btnStop.Enabled = true;
+        SetRunningButtonsState(running: true);
 
         bool panicArmed = RegisterPanicKey();
         string panicWarn = chkPanic.Checked && !panicArmed
@@ -919,7 +1440,15 @@ public partial class Form1 : Form
             bool bg = chkBackground.Checked;
             var acts = points.Select(p => p.Clone()).ToList();
             runDescription = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
-            worker = new Thread(() => RunSequence(acts, bg, limited, limit, jitterPx, jitterPct)) { IsBackground = true };
+            var options = new RunOptions
+            {
+                Background = bg,
+                Limited = limited,
+                Limit = limit,
+                JitterPixels = jitterPx,
+                JitterPercent = jitterPct
+            };
+            worker = new Thread(() => RunSequenceWorker(acts, options)) { IsBackground = true };
         }
         else
         {
@@ -931,7 +1460,23 @@ public partial class Form1 : Form
             int button = cmbButton.SelectedIndex;
             runDescription = hold ? $"Holding {cmbButton.Text} button... press {hotkeyName} to stop."
                                   : $"Clicking... press {hotkeyName} to stop.";
-            worker = new Thread(() => RunSingle(hold, dbl, button, useFixedPos, px, py, interval, limited && !hold, limit, jitterPx, jitterPct)) { IsBackground = true };
+            var options = new SingleRunOptions
+            {
+                Hold = hold,
+                DoubleClick = dbl,
+                Button = button,
+                UseFixedPosition = useFixedPos,
+                X = px,
+                Y = py,
+                IntervalMs = interval,
+                // A repeat count is meaningless for press-and-hold: computed at the call site,
+                // same as before the engine was extracted, so RunSingle itself stays dumb about it.
+                Limited = limited && !hold,
+                Limit = limit,
+                JitterPixels = jitterPx,
+                JitterPercent = jitterPct
+            };
+            worker = new Thread(() => RunSingleWorker(options)) { IsBackground = true };
         }
 
         if (delaySeconds <= 0)
@@ -993,161 +1538,34 @@ public partial class Form1 : Form
         return true;
     }
 
-    private void RunSingle(bool hold, bool dbl, int button, bool useFixedPos, int px, int py, int interval, bool limited, int limit, int jitterPx, int jitterPct)
+    // SequenceRunner itself never catches exceptions — it propagates them so the caller
+    // decides how to report an abort. This is that decision: surface it to the status label
+    // and always release the engine, exactly as the pre-extraction code did.
+    private void RunSingleWorker(SingleRunOptions options)
     {
-        using var timerRes = new TimerResolutionScope();
-        try
-        {
-            if (useFixedPos) SetCursorPos(px, py);
-            if (hold)
-            {
-                InputSender.HoldUntil(button, KeepGoing);
-            }
-            else
-            {
-                int count = 0;
-                while (running)
-                {
-                    if (useFixedPos) SetCursorPos(px + JitterPx(jitterPx), py + JitterPx(jitterPx));
-                    InputSender.Click(button, dbl);
-                    count++;
-                    if (limited && count >= limit) break;
-                    InterruptibleSleep(JitterMs(interval, jitterPct));
-                }
-            }
-        }
+        try { runner.RunSingle(options); }
         catch (Exception ex) { ReportError(ex); }
         finally { Finish(); }
     }
 
-    private void RunSequence(List<SeqAction> acts, bool background, bool limited, int limit, int jitterPx, int jitterPct)
+    private void RunSequenceWorker(List<SeqAction> acts, RunOptions options)
     {
-        using var timerRes = new TimerResolutionScope();
-        try
-        {
-            int pass = 0;
-            // Keyboard actions have no coordinates of their own; in background mode they
-            // are posted to the window of the most recent positioned action.
-            POINT lastTarget = CursorPos();
-
-            while (running)
-            {
-                for (int i = 0; i < acts.Count && running; i++)
-                {
-                    var a = acts[i];
-                    Highlight(i);
-                    bool performed = Execute(a, background, jitterPx, ref lastTarget);
-                    // Execute returns almost instantly when the gate suppresses the action, so
-                    // recoloring right after it returns still reads as "this row was skipped"
-                    // rather than a visible amber flash.
-                    if (!performed) Highlight(i, skipped: true);
-                    InterruptibleSleep(JitterMs(a.DelayMs, jitterPct));
-                }
-                pass++;
-                if (limited && pass >= limit) break;
-            }
-        }
+        try { runner.RunSequence(acts, options); }
         catch (Exception ex) { ReportError(ex); }
-        finally { Highlight(-1); Finish(); }
+        finally { Finish(); }
     }
 
-    /// <summary>
-    /// Evaluates the pixel gate on an ordinary (non-<see cref="ActionKind.WaitPixel"/>) action.
-    /// A failed sample — the point falls off every display — counts as "not matching", the same
-    /// rule <see cref="PixelSampler.WaitUntil"/> applies.
-    /// </summary>
-    private static bool GateOpen(SeqAction a)
+    // Fires just before a step is attempted — including one that then blocks for a while (a
+    // WaitPixel can sit here for its whole timeout) — so the row is painted amber right away
+    // rather than only once it finishes.
+    private void OnRunnerStepStarting(int index) => Highlight(index);
+
+    // Fires once a step has been attempted. A false `performed` means a pixel gate suppressed
+    // it; recolor that row the skipped grey-blue. index -1 means the run ended: clear everything.
+    private void OnRunnerStep(int index, bool performed)
     {
-        bool matches = PixelSampler.TrySample(a.CondX, a.CondY, out Color sampled)
-                    && PixelSampler.Matches(sampled, a.CondColor, a.CondTolerance);
-        return a.Condition == PixelCondition.IfMatch ? matches : !matches;
-    }
-
-    /// <summary>Performs one sequence step. Returns false when a pixel gate suppressed it.</summary>
-    private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
-    {
-        // A gate only applies to ordinary actions — WaitPixel is itself the wait mechanism, so
-        // its Condition means "what to wait for" instead (see SeqAction.Condition).
-        if (a.Kind != ActionKind.WaitPixel && a.Condition != PixelCondition.None && !GateOpen(a))
-        {
-            // The caller still applies a.DelayMs after a skip: skipping the delay too would let
-            // a run of gated-off actions spin the CPU at full speed waiting for their condition
-            // to change, instead of idling at the configured pace like every other action does.
-            return false;
-        }
-
-        if (a.Kind == ActionKind.WaitPixel)
-        {
-            if (a.Condition == PixelCondition.None) return true; // nothing to wait for
-
-            bool ok = PixelSampler.WaitUntil(a.CondX, a.CondY, a.CondColor, a.CondTolerance,
-                a.Condition == PixelCondition.IfMatch, a.PixelTimeoutMs, a.PollIntervalMs, KeepGoing);
-
-            // WaitUntil also returns false when the user stops the run mid-wait; only a real
-            // timeout — the run is still `running` — should be reported as one.
-            if (!ok && running && a.AbortRunOnTimeout)
-                throw new InvalidOperationException($"Timed out waiting for {a.DescribeColor()} at {a.CondX},{a.CondY}.");
-
-            return true;
-        }
-
-        bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
-        int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
-
-        if (positioned && a.WindowRelative)
-        {
-            if (!WindowAnchor.Resolve(a, a.X, a.Y, out POINT sp))
-                throw new InvalidOperationException($"Anchor window \"{a.WindowLabel}\" is not open.");
-            x = sp.X;
-            y = sp.Y;
-            if (a.Kind == ActionKind.Drag && WindowAnchor.Resolve(a, a.EndX, a.EndY, out POINT ep))
-            {
-                ex = ep.X;
-                ey = ep.Y;
-            }
-        }
-
-        if (positioned && jitterPx > 0)
-        {
-            x += JitterPx(jitterPx);
-            y += JitterPx(jitterPx);
-            if (a.Kind == ActionKind.Drag) { ex += JitterPx(jitterPx); ey += JitterPx(jitterPx); }
-        }
-
-        if (positioned) lastTarget = new POINT { X = x, Y = y };
-
-        switch (a.Kind)
-        {
-            case ActionKind.Click:
-                if (background) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs);
-                else { SetCursorPos(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs); }
-                break;
-
-            case ActionKind.Drag:
-                if (background) InputSender.BackgroundDrag(x, y, ex, ey, a.Button, a.DragMs, KeepGoing);
-                else InputSender.Drag(x, y, ex, ey, a.Button, a.DragMs, KeepGoing);
-                break;
-
-            case ActionKind.Scroll:
-                if (background) InputSender.BackgroundScroll(x, y, a.ScrollNotches, a.Horizontal);
-                else { SetCursorPos(x, y); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
-                break;
-
-            case ActionKind.Key:
-                if (background) InputSender.BackgroundCombo(lastTarget.X, lastTarget.Y, a.KeyCombo);
-                else InputSender.SendCombo(a.KeyCombo);
-                break;
-
-            case ActionKind.Text:
-                if (background) InputSender.BackgroundTypeText(lastTarget.X, lastTarget.Y, a.Text, KeepGoing);
-                else InputSender.TypeText(a.Text, KeepGoing);
-                break;
-
-            case ActionKind.Wait:
-                break; // the DelayMs after the action is the whole point
-        }
-
-        return true;
+        if (index < 0) { Highlight(-1); return; }
+        if (!performed) Highlight(index, skipped: true);
     }
 
     private bool KeepGoing() => running;
@@ -1206,10 +1624,19 @@ public partial class Form1 : Form
     private void OnStopped()
     {
         UnregisterPanicKey();
-        btnStart.Enabled = true;
-        btnStop.Enabled = false;
+        SetRunningButtonsState(running: false);
         // Confirming the buttons were force-released is the whole point of the panic key,
         // so don't let the worker's own async "Stopped" message land on top of that.
         lblStatus.Text = panicStopped ? PanicMessage : $"Stopped. Press {hotkeyName} to start.";
+    }
+
+    // Keeps the tray menu's Start/Stop items in step with the main buttons — this is the only
+    // place either pair is ever set, so they can't drift apart.
+    private void SetRunningButtonsState(bool running)
+    {
+        btnStart.Enabled = !running;
+        btnStop.Enabled = running;
+        miStart.Enabled = !running;
+        miStop.Enabled = running;
     }
 }

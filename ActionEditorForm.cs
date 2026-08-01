@@ -14,8 +14,14 @@ internal sealed class ActionEditorForm : Form
     private readonly NumericUpDown numX = NewNum(-100000, 100000);
     private readonly NumericUpDown numY = NewNum(-100000, 100000);
     private readonly Button btnPick = new() { Text = "Pick (3s)…", AutoSize = true, Margin = new Padding(6, 3, 3, 3) };
+    private readonly Button btnProbe = new() { Text = "What's here?", AutoSize = true, Margin = new Padding(6, 3, 3, 3) };
     private readonly CheckBox chkAnchor = new() { Text = "Anchor to the window it's in", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
     private readonly Label lblAnchor = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 6, 3, 3) };
+    private readonly ComboBox cmbClickMethod = NewCombo(280,
+        "Real input (moves the cursor)",
+        "Background messages (no cursor movement)",
+        "UI Automation invoke (no cursor movement)");
+    private readonly Label lblClickMethodHint = new() { AutoSize = true, MaximumSize = new Size(340, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
     private readonly ComboBox cmbButton = NewCombo(150, "Left", "Right", "Middle");
     private readonly ComboBox cmbClickType = NewCombo(150, "Single", "Double");
     private readonly NumericUpDown numHold = NewNum(0, 600000);
@@ -95,6 +101,7 @@ internal sealed class ActionEditorForm : Form
             // whenever the kind crosses that line.
             RebuildConditionLabels();
             ApplyKindVisibility();
+            UpdateClickMethodHint();
         };
 
         var posFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
@@ -102,7 +109,9 @@ internal sealed class ActionEditorForm : Form
         posFlow.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
         posFlow.Controls.Add(numY);
         posFlow.Controls.Add(btnPick);
+        posFlow.Controls.Add(btnProbe);
         btnPick.Click += (_, _) => StartPick();
+        btnProbe.Click += (_, _) => ProbeAt();
 
         var endFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
         endFlow.Controls.Add(numEndX);
@@ -124,6 +133,8 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "Position  X", posFlow, k => UsesPosition(k));
         AddRow(root, "", chkAnchor, k => UsesPosition(k));
         AddRow(root, "", lblAnchor, k => UsesPosition(k) && chkAnchor.Checked);
+        AddRow(root, "Click method:", cmbClickMethod, k => UsesPosition(k));
+        AddRow(root, "", lblClickMethodHint, k => UsesPosition(k));
         AddRow(root, "Mouse button:", cmbButton, k => k is ActionKind.Click or ActionKind.Drag);
         AddRow(root, "Click type:", cmbClickType, k => k is ActionKind.Click);
         AddRow(root, "Hold button (ms):", numHold, k => k is ActionKind.Click);
@@ -151,6 +162,7 @@ internal sealed class ActionEditorForm : Form
         numX.Value = action.X;
         numY.Value = action.Y;
         chkAnchor.Checked = action.WindowRelative;
+        cmbClickMethod.SelectedIndex = Math.Clamp(action.ClickMethod, 0, 2);
         cmbButton.SelectedIndex = Math.Clamp(action.Button, 0, 2);
         cmbClickType.SelectedIndex = action.DoubleClick ? 1 : 0;
         numHold.Value = action.HoldMs;
@@ -176,6 +188,7 @@ internal sealed class ActionEditorForm : Form
         numPollInterval.Value = action.PollIntervalMs;
 
         chkAnchor.CheckedChanged += (_, _) => AnchorToggled();
+        cmbClickMethod.SelectedIndexChanged += (_, _) => UpdateClickMethodHint();
         txtCombo.TextChanged += (_, _) => ValidateCombo();
         // Hand-editing the coordinates must re-sample, or the swatch would silently
         // disagree with what CondX/CondY now point at.
@@ -199,6 +212,7 @@ internal sealed class ActionEditorForm : Form
         UpdateAnchorLabel();
         ValidateCombo();
         ApplyKindVisibility();
+        UpdateClickMethodHint();
     }
 
     private static bool UsesPosition(ActionKind k) => k is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
@@ -233,6 +247,61 @@ internal sealed class ActionEditorForm : Form
         // An AutoSize row collapses only once every control in it is hidden, which is
         // what makes the dialog shrink to the selected kind.
         PerformLayout();
+    }
+
+    // ---- Click method wording ----
+
+    /// <summary>
+    /// Rebuilds the click-method hint for the current method + kind. The wording differs
+    /// per method because the trade-offs are genuinely confusing and a wrong choice looks
+    /// like "the app is broken" rather than "this window doesn't support that method".
+    /// </summary>
+    private void UpdateClickMethodHint()
+    {
+        lblClickMethodHint.Text = cmbClickMethod.SelectedIndex switch
+        {
+            0 => "Works everywhere, but moves the physical cursor.",
+            1 => "No cursor movement; works on classic Win32 windows but is ignored by " +
+                 "Chrome/Electron, WPF, UWP/WinUI and elevated windows.",
+            2 => BuildUiaHint(SelectedKind),
+            _ => "",
+        };
+    }
+
+    private static string BuildUiaHint(ActionKind kind)
+    {
+        if (!UiaInvoker.IsAvailable)
+            return "UI Automation is not available on this machine — the engine will fall back to real input.";
+
+        if (kind is ActionKind.Drag or ActionKind.Scroll)
+            return "UI Automation has no drag/scroll equivalent, so the engine falls back to background messages for this action.";
+
+        return "No cursor movement; works on WPF, UWP/WinUI and Chrome. A UIA invoke " +
+               "activates the control directly, so button choice, double-click and hold time are ignored.";
+    }
+
+    /// <summary>
+    /// Probes what UI Automation sees at the action's current target, before ever running
+    /// it — otherwise whether a target is reachable by UIA is pure trial and error.
+    /// </summary>
+    private void ProbeAt()
+    {
+        int x = (int)numX.Value;
+        int y = (int)numY.Value;
+
+        if (chkAnchor.Checked)
+        {
+            var probe = new SeqAction { WindowClass = anchorClass, WindowTitle = anchorTitle };
+            if (!WindowAnchor.Resolve(probe, x, y, out POINT screenPt))
+            {
+                lblClickMethodHint.Text = "Window not currently open — can't probe.";
+                return;
+            }
+            x = screenPt.X;
+            y = screenPt.Y;
+        }
+
+        lblClickMethodHint.Text = UiaInvoker.DescribeAt(x, y) ?? "Nothing found there.";
     }
 
     // ---- Pixel condition wording ----
@@ -419,6 +488,7 @@ internal sealed class ActionEditorForm : Form
         action.WindowRelative = chkAnchor.Checked;
         action.WindowClass = anchorClass;
         action.WindowTitle = anchorTitle;
+        action.ClickMethod = cmbClickMethod.SelectedIndex;
         action.Button = cmbButton.SelectedIndex;
         action.DoubleClick = cmbClickType.SelectedIndex == 1;
         action.HoldMs = (int)numHold.Value;

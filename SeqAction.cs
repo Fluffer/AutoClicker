@@ -56,6 +56,9 @@ public sealed class SeqAction
     /// <summary>Click only: keep the button down this long before releasing.</summary>
     public int HoldMs { get; set; }
 
+    /// <summary>0 = real input (SendInput), 1 = PostMessage, 2 = UI Automation invoke.</summary>
+    public int ClickMethod { get; set; }
+
     // ---- Drag ----
     public int EndX { get; set; }
     public int EndY { get; set; }
@@ -137,6 +140,7 @@ public sealed class SeqAction
         Button = Math.Clamp(Button, 0, 2);
         DelayMs = Math.Max(0, DelayMs);
         HoldMs = Math.Max(0, HoldMs);
+        ClickMethod = Math.Clamp(ClickMethod, 0, 2);
         DragMs = Math.Max(0, DragMs);
         if (!Enum.IsDefined(Kind)) Kind = ActionKind.Click;
         KeyCombo ??= "";

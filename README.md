@@ -34,6 +34,12 @@ fixed point, or run a recorded **sequence of points** with per-point waits.
   target window first
 - **Settings persist** between launches in `%AppData%\AutoClicker\settings.json`,
   including the last sequence you saved or loaded
+- **Profiles** — several named sequences, each with its own optional F1–F12 hotkey,
+  so one key runs your farming loop and another runs your login macro
+- **System tray** — optionally minimise to the tray and start/stop from there
+- **Command line** — scriptable and schedulable, see below
+- **Three ways to click** — real input, posted messages, or a UI Automation invoke
+  that reaches WPF/UWP/Chrome without moving the cursor
 - High-DPI aware, negative (multi-monitor) coordinates supported, custom icon,
   single self-contained build
 
@@ -78,21 +84,56 @@ Or via PowerShell:
 Add-AppxPackage -Path AutoClicker.msix
 ```
 
-## Background mode — what works
+## Clicking without moving the cursor
 
-Background mode uses `PostMessage` to the window under each point. It works for many
-classic Win32 apps but **fails** on:
+Each click / drag / scroll action picks one of three methods:
 
-- Games using DirectInput / raw input (`WM_INPUT`)
-- Chrome / Electron (events flagged `isTrusted: false`)
-- UWP / WinUI / WPF (single window handle, internal hit-testing)
-- Admin-elevated targets (blocked by UIPI)
+| Method | Moves cursor | Reaches |
+|---|---|---|
+| **Real input** (`SendInput`) | Yes | Everything, including games |
+| **Background messages** (`PostMessage`) | No | Classic Win32 windows |
+| **UI Automation invoke** | No | WPF, UWP/WinUI, Chrome — most modern apps |
 
-For those, use normal (foreground) mode, which moves the cursor.
+**Background messages** fail on Chrome/Electron (events arrive `isTrusted: false`),
+on UWP/WinUI/WPF (one window handle, internal hit-testing), on DirectInput/raw-input
+games, and on elevated windows (blocked by UIPI).
+
+**UI Automation** covers most of that gap: it activates the control under the point
+through its accessibility provider rather than faking input. Caveats worth knowing:
+
+- It *invokes a control*, so it ignores the button choice, double-click and hold time.
+- There is no UIA equivalent of a drag or a scroll notch — those fall back to
+  background messages.
+- It refuses to act when the point isn't over a window, rather than silently
+  "succeeding" against the desktop.
+- Nothing reaches DirectInput games except real input.
 
 Keyboard actions in background mode are posted to the window of the most recent
-positioned action in the sequence, and are the least reliable part of it —
-synthesised `WM_KEY*` messages are ignored by most modern frameworks.
+positioned action, and are the least reliable part — synthesised `WM_KEY*` messages
+are ignored by most modern frameworks.
+
+## Command line
+
+With no arguments the GUI launches as usual. With arguments it runs headlessly,
+sharing the exact same engine as the GUI.
+
+```powershell
+AutoClicker.exe --run sequence.acseq --repeat 10
+AutoClicker.exe --profile "Farm loop" --until-stopped
+AutoClicker.exe --list
+AutoClicker.exe --help
+```
+
+| Option | |
+|---|---|
+| `--repeat <n>` | Run the sequence n times |
+| `--until-stopped` | Repeat until Ctrl+C |
+| `--background` | Use background mode |
+| `--jitter-px <n>` / `--jitter-pct <n>` | Position / timing randomisation |
+| `--start-delay <s>` | Wait before starting |
+
+Exit codes: `0` success (including a clean Ctrl+C), `1` runtime failure, `2` bad usage.
+Ctrl+C stops cleanly and always releases any held mouse button.
 
 ## Build
 
