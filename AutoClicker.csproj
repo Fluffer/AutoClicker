@@ -9,6 +9,9 @@
     <ApplicationIcon>AutoClicker.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyTitle>Auto Clicker</AssemblyTitle>
+    <!-- Keep in step with Version in packaging\AppxManifest.xml (which needs 4 parts).
+         This is what the CLI version flag reports. -->
+    <Version>1.1.0</Version>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisMode>Recommended</AnalysisMode>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
