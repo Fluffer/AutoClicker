@@ -29,11 +29,26 @@ internal sealed class ActionEditorForm : Form
     private readonly TextBox txtText = new() { Width = 260, Height = 80, Multiline = true, ScrollBars = ScrollBars.Vertical, AcceptsReturn = true, Margin = new Padding(3, 4, 3, 3) };
     private readonly NumericUpDown numDelay = NewNum(0, int.MaxValue);
 
+    // ---- Pixel condition / WaitPixel ----
+    private readonly ComboBox cmbCondition = NewCombo(260);
+    private readonly NumericUpDown numCondX = NewNum(-100000, 100000);
+    private readonly NumericUpDown numCondY = NewNum(-100000, 100000);
+    private readonly Button btnPickPixel = new() { Text = "Pick pixel (3s)…", AutoSize = true, Margin = new Padding(6, 3, 3, 3) };
+    private readonly Panel pnlSwatch = new() { Size = new Size(24, 24), BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(3, 4, 3, 3) };
+    private readonly Label lblSwatchText = new() { AutoSize = true, Margin = new Padding(6, 7, 3, 3) };
+    private readonly NumericUpDown numTolerance = NewNum(0, 255);
+    private readonly Label lblToleranceHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+    private readonly NumericUpDown numPixelTimeout = NewNum(0, 3600000);
+    private readonly CheckBox chkAbortOnTimeout = new() { Text = "Stop the whole run if it times out", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+    private readonly NumericUpDown numPollInterval = NewNum(10, 60000);
+
     private readonly List<(Control label, Control field, Func<ActionKind, bool> visibleFor)> rows = new();
     private readonly Button btnOk;
 
     private System.Windows.Forms.Timer? pickTimer;
     private int pickCountdown;
+    private System.Windows.Forms.Timer? pickPixelTimer;
+    private int pickPixelCountdown;
 
     // Window anchoring keeps both representations so toggling the checkbox can convert
     // between them instead of throwing the coordinates away.
@@ -71,9 +86,16 @@ internal sealed class ActionEditorForm : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         Controls.Add(root);
 
-        cmbKind.Items.AddRange(new object[] { "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only" });
+        cmbKind.Items.AddRange(new object[] { "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only", "Wait for pixel" });
         cmbKind.SelectedIndex = (int)action.Kind;
-        cmbKind.SelectedIndexChanged += (_, _) => ApplyKindVisibility();
+        cmbKind.SelectedIndexChanged += (_, _) =>
+        {
+            // The condition wording means something different for WaitPixel (it's the wait
+            // itself) versus every other kind (it's a gate), so the combo text is rebuilt
+            // whenever the kind crosses that line.
+            RebuildConditionLabels();
+            ApplyKindVisibility();
+        };
 
         var posFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
         posFlow.Controls.Add(numX);
@@ -86,6 +108,17 @@ internal sealed class ActionEditorForm : Form
         endFlow.Controls.Add(numEndX);
         endFlow.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
         endFlow.Controls.Add(numEndY);
+
+        var condPosFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        condPosFlow.Controls.Add(numCondX);
+        condPosFlow.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
+        condPosFlow.Controls.Add(numCondY);
+        condPosFlow.Controls.Add(btnPickPixel);
+        btnPickPixel.Click += (_, _) => StartPickPixel();
+
+        var swatchFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        swatchFlow.Controls.Add(pnlSwatch);
+        swatchFlow.Controls.Add(lblSwatchText);
 
         AddRow(root, "Action:", cmbKind, _ => true);
         AddRow(root, "Position  X", posFlow, k => UsesPosition(k));
@@ -101,6 +134,18 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "Key combo:", txtCombo, k => k is ActionKind.Key);
         AddRow(root, "", lblComboHint, k => k is ActionKind.Key);
         AddRow(root, "Text:", txtText, k => k is ActionKind.Text);
+
+        // Pixel condition rows apply to every kind: any action can be gated on a pixel
+        // colour, and a WaitPixel action IS the wait built from these same fields.
+        AddRow(root, "Pixel condition:", cmbCondition, _ => true);
+        AddRow(root, "Pixel point  X", condPosFlow, _ => true);
+        AddRow(root, "Pixel color:", swatchFlow, _ => true);
+        AddRow(root, "Tolerance:", numTolerance, _ => true);
+        AddRow(root, "", lblToleranceHint, _ => true);
+        AddRow(root, "Wait timeout (ms, 0 = forever):", numPixelTimeout, k => k == ActionKind.WaitPixel);
+        AddRow(root, "", chkAbortOnTimeout, k => k == ActionKind.WaitPixel);
+        AddRow(root, "Check every (ms):", numPollInterval, k => k == ActionKind.WaitPixel);
+
         AddRow(root, "Wait after (ms):", numDelay, _ => true);
 
         numX.Value = action.X;
@@ -118,15 +163,33 @@ internal sealed class ActionEditorForm : Form
         txtText.Text = action.Text;
         numDelay.Value = action.DelayMs;
 
+        cmbCondition.Items.AddRange(ConditionLabels(SelectedKind));
+        cmbCondition.SelectedIndex = (int)action.Condition;
+        numCondX.Value = action.CondX;
+        numCondY.Value = action.CondY;
+        pnlSwatch.BackColor = PixelSampler.FromRgb(action.CondColor);
+        lblSwatchText.Text = action.DescribeColor();
+        numTolerance.Value = action.CondTolerance;
+        lblToleranceHint.Text = "0 = exact match, higher allows more drift";
+        numPixelTimeout.Value = Math.Clamp(action.PixelTimeoutMs, numPixelTimeout.Minimum, numPixelTimeout.Maximum);
+        chkAbortOnTimeout.Checked = action.AbortRunOnTimeout;
+        numPollInterval.Value = action.PollIntervalMs;
+
         chkAnchor.CheckedChanged += (_, _) => AnchorToggled();
         txtCombo.TextChanged += (_, _) => ValidateCombo();
+        // Hand-editing the coordinates must re-sample, or the swatch would silently
+        // disagree with what CondX/CondY now point at.
+        numCondX.ValueChanged += (_, _) => UpdateColorSwatch();
+        numCondY.ValueChanged += (_, _) => UpdateColorSwatch();
 
         btnOk = new Button { Text = "OK", AutoSize = true, MinimumSize = new Size(80, 30), DialogResult = DialogResult.OK, Margin = new Padding(3) };
         var btnCancel = new Button { Text = "Cancel", AutoSize = true, MinimumSize = new Size(80, 30), DialogResult = DialogResult.Cancel, Margin = new Padding(3) };
         var buttons = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, Margin = new Padding(0, 10, 0, 0) };
         buttons.Controls.Add(btnCancel);
         buttons.Controls.Add(btnOk);
-        root.Controls.Add(buttons, 0, root.RowCount);
+        int buttonRow = root.RowCount++;
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.Controls.Add(buttons, 0, buttonRow);
         root.SetColumnSpan(buttons, 2);
 
         AcceptButton = btnOk;
@@ -145,7 +208,14 @@ internal sealed class ActionEditorForm : Form
     private void AddRow(TableLayoutPanel root, string labelText, Control field, Func<ActionKind, bool> visibleFor)
     {
         var label = new Label { Text = labelText, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 8, 3) };
-        int row = root.RowCount;
+
+        // RowCount must be grown explicitly and a matching AutoSize RowStyle added. Reading
+        // RowCount without incrementing it hands every row the same index, and the panel then
+        // scatters the overflow into arbitrary cells instead of stacking label/field pairs.
+        // The AutoSize style is also what lets a row collapse to nothing once every control
+        // in it is hidden, which is how the dialog shrinks to the selected action kind.
+        int row = root.RowCount++;
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.Controls.Add(label, 0, row);
         root.Controls.Add(field, 1, row);
         rows.Add((label, field, visibleFor));
@@ -163,6 +233,37 @@ internal sealed class ActionEditorForm : Form
         // An AutoSize row collapses only once every control in it is hidden, which is
         // what makes the dialog shrink to the selected kind.
         PerformLayout();
+    }
+
+    // ---- Pixel condition wording ----
+
+    /// <summary>Rebuilds the condition combo's wording for the current kind, keeping the selection.</summary>
+    private void RebuildConditionLabels()
+    {
+        int keep = Math.Max(cmbCondition.SelectedIndex, 0);
+        cmbCondition.Items.Clear();
+        cmbCondition.Items.AddRange(ConditionLabels(SelectedKind));
+        cmbCondition.SelectedIndex = keep;
+    }
+
+    private static object[] ConditionLabels(ActionKind kind) => kind == ActionKind.WaitPixel
+        ? new object[] { "(nothing — no-op)", "Wait until the pixel matches", "Wait until the pixel stops matching" }
+        : new object[] { "Always run this action", "Only if the pixel matches", "Only if the pixel does NOT match" };
+
+    /// <summary>Keeps the swatch honest with CondX/CondY: called after either changes.</summary>
+    private void UpdateColorSwatch()
+    {
+        if (PixelSampler.TrySample((int)numCondX.Value, (int)numCondY.Value, out Color c))
+        {
+            pnlSwatch.BackColor = c;
+            lblSwatchText.Text = PixelSampler.DescribeRgb(PixelSampler.ToRgb(c));
+        }
+        else
+        {
+            // Point is off every display: keep showing the last known colour rather than
+            // guessing, and say so instead of crashing on the failed sample.
+            lblSwatchText.Text = "#—— (off-screen)";
+        }
     }
 
     // ---- Position picking ----
@@ -188,6 +289,35 @@ internal sealed class ActionEditorForm : Form
             CaptureAt(p);
         };
         pickTimer.Start();
+    }
+
+    /// <summary>
+    /// Same countdown idiom as <see cref="StartPick"/>, but captures a point AND its colour
+    /// in one grab: the user hovers the thing they care about and gets both at once.
+    /// </summary>
+    private void StartPickPixel()
+    {
+        pickPixelCountdown = 3;
+        btnPickPixel.Enabled = false;
+        pickPixelTimer?.Dispose();
+        pickPixelTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        btnPickPixel.Text = $"{pickPixelCountdown}…";
+        pickPixelTimer.Tick += (_, _) =>
+        {
+            if (--pickPixelCountdown > 0) { btnPickPixel.Text = $"{pickPixelCountdown}…"; return; }
+
+            pickPixelTimer!.Stop();
+            pickPixelTimer.Dispose();
+            pickPixelTimer = null;
+            btnPickPixel.Text = "Pick pixel (3s)…";
+            btnPickPixel.Enabled = true;
+
+            GetCursorPos(out POINT p);
+            numCondX.Value = Math.Clamp(p.X, numCondX.Minimum, numCondX.Maximum);
+            numCondY.Value = Math.Clamp(p.Y, numCondY.Minimum, numCondY.Maximum);
+            UpdateColorSwatch();
+        };
+        pickPixelTimer.Start();
     }
 
     private void CaptureAt(POINT screenPt)
@@ -276,6 +406,12 @@ internal sealed class ActionEditorForm : Form
             e.Cancel = true;
             return;
         }
+        if (kind == ActionKind.WaitPixel && (PixelCondition)cmbCondition.SelectedIndex == PixelCondition.None)
+        {
+            MessageBox.Show(this, "Set what to wait for.", "Nothing to wait for", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = true;
+            return;
+        }
 
         action.Kind = kind;
         action.X = (int)numX.Value;
@@ -294,6 +430,14 @@ internal sealed class ActionEditorForm : Form
         action.KeyCombo = txtCombo.Text.Trim();
         action.Text = txtText.Text;
         action.DelayMs = (int)numDelay.Value;
+        action.Condition = (PixelCondition)cmbCondition.SelectedIndex;
+        action.CondX = (int)numCondX.Value;
+        action.CondY = (int)numCondY.Value;
+        action.CondColor = PixelSampler.ToRgb(pnlSwatch.BackColor);
+        action.CondTolerance = (int)numTolerance.Value;
+        action.PixelTimeoutMs = (int)numPixelTimeout.Value;
+        action.AbortRunOnTimeout = chkAbortOnTimeout.Checked;
+        action.PollIntervalMs = (int)numPollInterval.Value;
         action.Normalize();
     }
 
@@ -304,6 +448,9 @@ internal sealed class ActionEditorForm : Form
             pickTimer?.Stop();
             pickTimer?.Dispose();
             pickTimer = null;
+            pickPixelTimer?.Stop();
+            pickPixelTimer?.Dispose();
+            pickPixelTimer = null;
         }
         base.Dispose(disposing);
     }

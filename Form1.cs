@@ -1036,7 +1036,11 @@ public partial class Form1 : Form
                 {
                     var a = acts[i];
                     Highlight(i);
-                    Execute(a, background, jitterPx, ref lastTarget);
+                    bool performed = Execute(a, background, jitterPx, ref lastTarget);
+                    // Execute returns almost instantly when the gate suppresses the action, so
+                    // recoloring right after it returns still reads as "this row was skipped"
+                    // rather than a visible amber flash.
+                    if (!performed) Highlight(i, skipped: true);
                     InterruptibleSleep(JitterMs(a.DelayMs, jitterPct));
                 }
                 pass++;
@@ -1047,8 +1051,46 @@ public partial class Form1 : Form
         finally { Highlight(-1); Finish(); }
     }
 
-    private void Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
+    /// <summary>
+    /// Evaluates the pixel gate on an ordinary (non-<see cref="ActionKind.WaitPixel"/>) action.
+    /// A failed sample — the point falls off every display — counts as "not matching", the same
+    /// rule <see cref="PixelSampler.WaitUntil"/> applies.
+    /// </summary>
+    private static bool GateOpen(SeqAction a)
     {
+        bool matches = PixelSampler.TrySample(a.CondX, a.CondY, out Color sampled)
+                    && PixelSampler.Matches(sampled, a.CondColor, a.CondTolerance);
+        return a.Condition == PixelCondition.IfMatch ? matches : !matches;
+    }
+
+    /// <summary>Performs one sequence step. Returns false when a pixel gate suppressed it.</summary>
+    private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
+    {
+        // A gate only applies to ordinary actions — WaitPixel is itself the wait mechanism, so
+        // its Condition means "what to wait for" instead (see SeqAction.Condition).
+        if (a.Kind != ActionKind.WaitPixel && a.Condition != PixelCondition.None && !GateOpen(a))
+        {
+            // The caller still applies a.DelayMs after a skip: skipping the delay too would let
+            // a run of gated-off actions spin the CPU at full speed waiting for their condition
+            // to change, instead of idling at the configured pace like every other action does.
+            return false;
+        }
+
+        if (a.Kind == ActionKind.WaitPixel)
+        {
+            if (a.Condition == PixelCondition.None) return true; // nothing to wait for
+
+            bool ok = PixelSampler.WaitUntil(a.CondX, a.CondY, a.CondColor, a.CondTolerance,
+                a.Condition == PixelCondition.IfMatch, a.PixelTimeoutMs, a.PollIntervalMs, KeepGoing);
+
+            // WaitUntil also returns false when the user stops the run mid-wait; only a real
+            // timeout — the run is still `running` — should be reported as one.
+            if (!ok && running && a.AbortRunOnTimeout)
+                throw new InvalidOperationException($"Timed out waiting for {a.DescribeColor()} at {a.CondX},{a.CondY}.");
+
+            return true;
+        }
+
         bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
         int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
 
@@ -1104,11 +1146,16 @@ public partial class Form1 : Form
             case ActionKind.Wait:
                 break; // the DelayMs after the action is the whole point
         }
+
+        return true;
     }
 
     private bool KeepGoing() => running;
 
-    private void Highlight(int index)
+    private static readonly Color RunningHighlight = Color.FromArgb(255, 230, 160); // amber: this row is executing
+    private static readonly Color SkippedHighlight = Color.FromArgb(210, 224, 236); // calmer grey-blue: gate suppressed this row
+
+    private void Highlight(int index, bool skipped = false)
     {
         if (!IsHandleCreated) return;
         try
@@ -1118,7 +1165,7 @@ public partial class Form1 : Form
                 foreach (ListViewItem it in lvPoints.Items) it.BackColor = lvPoints.BackColor;
                 if (index >= 0 && index < lvPoints.Items.Count)
                 {
-                    lvPoints.Items[index].BackColor = Color.FromArgb(255, 230, 160);
+                    lvPoints.Items[index].BackColor = skipped ? SkippedHighlight : RunningHighlight;
                     lvPoints.Items[index].EnsureVisible();
                 }
             });

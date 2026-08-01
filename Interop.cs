@@ -185,6 +185,20 @@ internal static class Native
     [DllImport("user32.dll")]
     internal static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
+    // ---- gdi32 (pixel sampling) ----
+
+    /// <summary>What GetPixel returns when the point is not on any display.</summary>
+    internal const uint CLR_INVALID = 0xFFFFFFFF;
+
+    [DllImport("gdi32.dll")]
+    internal static extern uint GetPixel(IntPtr hdc, int x, int y);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+
     // ---- kernel32 / winmm ----
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]

@@ -47,6 +47,24 @@ fixed point, or run a recorded **sequence of points** with per-point waits.
 | **Key press** | A combo such as `Ctrl+C`, `Alt+Tab`, `Shift+F5`, `Enter`, `Esc`. |
 | **Type text** | Literal text, sent as Unicode — the keyboard layout doesn't matter. |
 | **Wait** | Nothing but the delay. Useful for letting a target catch up. |
+| **Wait for pixel** | Block until a screen pixel matches (or stops matching) a colour, with an optional timeout. |
+
+## Pixel conditions
+
+Any action can be gated on the colour of a screen pixel, which is what turns a blind
+repeater into something reactive:
+
+- **Gate** — "only click if the pixel at (400,300) is `#1E90FF`", or *only if it isn't*.
+  A gated-off action is skipped but still honours its wait, so a mostly-skipped
+  sequence doesn't spin the CPU. Skipped rows are tinted grey-blue in the list.
+- **Wait for pixel** — block until the pixel matches, then carry on. Optionally give up
+  after N ms, and optionally stop the whole run when it does.
+
+Pick the point and its colour together with **Pick pixel (3s)** — hover the thing you
+care about and both the coordinates and the colour are captured. **Tolerance** is the
+maximum per-channel difference that still counts as a match (0 = exact).
+
+Pixel coordinates are always screen coordinates and are never window-anchored.
 
 ## Install
 

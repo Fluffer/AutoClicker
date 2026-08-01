@@ -11,6 +11,24 @@ public enum ActionKind
     Key = 3,
     Text = 4,
     Wait = 5,
+    WaitPixel = 6,
+}
+
+/// <summary>
+/// Whether a pixel-color check gates an action, and which way.
+/// </summary>
+/// <remarks>
+/// The same enum drives two mechanisms depending on <see cref="SeqAction.Kind"/>:
+/// on any ordinary action it is a gate (<see cref="None"/> always runs, <see cref="IfMatch"/>/
+/// <see cref="IfNoMatch"/> run only when the pixel does/doesn't match); on a
+/// <see cref="ActionKind.WaitPixel"/> action the same values instead describe what to wait
+/// for, since a wait step has no action of its own to gate.
+/// </remarks>
+public enum PixelCondition
+{
+    None = 0,
+    IfMatch = 1,
+    IfNoMatch = 2,
 }
 
 /// <summary>
@@ -66,6 +84,41 @@ public sealed class SeqAction
     public string WindowClass { get; set; } = "";
     public string WindowTitle { get; set; } = "";
 
+    // ---- Pixel condition / WaitPixel ----
+    /// <summary>
+    /// On any action, gates whether it runs at all: <see cref="PixelCondition.None"/> always
+    /// runs it, <see cref="PixelCondition.IfMatch"/>/<see cref="PixelCondition.IfNoMatch"/> run
+    /// it only when the pixel at (<see cref="CondX"/>,<see cref="CondY"/>) does/doesn't match
+    /// <see cref="CondColor"/>. On a <see cref="ActionKind.WaitPixel"/> action there is nothing
+    /// else to gate, so this instead says what to wait for: <see cref="PixelCondition.IfMatch"/>
+    /// blocks until the pixel matches, <see cref="PixelCondition.IfNoMatch"/> blocks until it
+    /// stops matching. A <see cref="ActionKind.WaitPixel"/> left at <see cref="PixelCondition.None"/>
+    /// has nothing to wait for and the engine should treat it as a no-op.
+    /// </summary>
+    public PixelCondition Condition { get; set; } = PixelCondition.None;
+
+    /// <summary>
+    /// Screen coordinates of the pixel to sample. Unlike <see cref="X"/>/<see cref="Y"/>, these
+    /// are never window-anchored: <see cref="WindowRelative"/> applies only to X/Y/EndX/EndY.
+    /// </summary>
+    public int CondX { get; set; }
+    public int CondY { get; set; }
+
+    /// <summary>Color to compare against, packed as 0xRRGGBB.</summary>
+    public int CondColor { get; set; }
+
+    /// <summary>Maximum allowed per-channel delta (0-255) for a color to still "match".</summary>
+    public int CondTolerance { get; set; } = 10;
+
+    /// <summary><see cref="ActionKind.WaitPixel"/> only: give up after this long. 0 waits indefinitely.</summary>
+    public int PixelTimeoutMs { get; set; }
+
+    /// <summary><see cref="ActionKind.WaitPixel"/> only: abort the whole run if the wait times out.</summary>
+    public bool AbortRunOnTimeout { get; set; }
+
+    /// <summary><see cref="ActionKind.WaitPixel"/> only: how often to re-sample while waiting.</summary>
+    public int PollIntervalMs { get; set; } = 50;
+
     /// <summary>Wait AFTER this action, before the next one.</summary>
     public int DelayMs { get; set; }
 
@@ -90,31 +143,65 @@ public sealed class SeqAction
         Text ??= "";
         WindowClass ??= "";
         WindowTitle ??= "";
+        if (!Enum.IsDefined(Condition)) Condition = PixelCondition.None;
+        CondX = Math.Clamp(CondX, -100000, 100000);
+        CondY = Math.Clamp(CondY, -100000, 100000);
+        CondColor = Math.Clamp(CondColor, 0x000000, 0xFFFFFF);
+        CondTolerance = Math.Clamp(CondTolerance, 0, 255);
+        PixelTimeoutMs = Math.Max(0, PixelTimeoutMs);
+        PollIntervalMs = Math.Clamp(PollIntervalMs, 10, 60000);
     }
 
     public string ButtonName => Button switch { 1 => "Right", 2 => "Middle", _ => "Left" };
 
     /// <summary>Human-readable summary for the sequence list.</summary>
-    public string Describe() => Kind switch
+    /// <remarks>
+    /// A gate on a non-<see cref="ActionKind.WaitPixel"/> action appends a compact suffix
+    /// (e.g. "(if #1E90FF at 400,300)") so the condition is visible without opening the editor.
+    /// <see cref="ActionKind.WaitPixel"/> never gets that suffix: it *is* the gate, so its
+    /// <see cref="Condition"/> is described as the wait itself instead.
+    /// </remarks>
+    public string Describe()
     {
-        ActionKind.Click => DoubleClick ? $"Double-click {ButtonName}"
-                          : HoldMs > 0 ? $"Hold {ButtonName} {HoldMs} ms"
-                          : $"Click {ButtonName}",
-        ActionKind.Drag => $"Drag {ButtonName} to {EndX},{EndY} over {DragMs} ms",
-        ActionKind.Scroll => $"Scroll {(Horizontal ? "horizontally " : "")}{ScrollNotches:+#;-#;0} notches",
-        ActionKind.Key => $"Press {KeyCombo}",
-        ActionKind.Text => $"Type \"{Ellipsis(SingleLine(Text), 32)}\"",
-        ActionKind.Wait => "Wait",
-        _ => Kind.ToString(),
-    };
+        string baseDesc = Kind switch
+        {
+            ActionKind.Click => DoubleClick ? $"Double-click {ButtonName}"
+                              : HoldMs > 0 ? $"Hold {ButtonName} {HoldMs} ms"
+                              : $"Click {ButtonName}",
+            ActionKind.Drag => $"Drag {ButtonName} to {EndX},{EndY} over {DragMs} ms",
+            ActionKind.Scroll => $"Scroll {(Horizontal ? "horizontally " : "")}{ScrollNotches:+#;-#;0} notches",
+            ActionKind.Key => $"Press {KeyCombo}",
+            ActionKind.Text => $"Type \"{Ellipsis(SingleLine(Text), 32)}\"",
+            ActionKind.Wait => "Wait",
+            ActionKind.WaitPixel => Condition switch
+            {
+                PixelCondition.IfMatch => $"Wait until {DescribeColor()} at {CondX},{CondY}",
+                PixelCondition.IfNoMatch => $"Wait while {DescribeColor()} at {CondX},{CondY}",
+                _ => "Wait for pixel (no condition set)",
+            },
+            _ => Kind.ToString(),
+        };
+
+        if (Kind == ActionKind.WaitPixel || Condition == PixelCondition.None) return baseDesc;
+
+        string suffix = Condition == PixelCondition.IfMatch
+            ? $"if {DescribeColor()} at {CondX},{CondY}"
+            : $"unless {DescribeColor()} at {CondX},{CondY}";
+        return $"{baseDesc} ({suffix})";
+    }
 
     /// <summary>Target column for the sequence list.</summary>
     public string DescribeTarget()
     {
+        // WaitPixel has no click target of its own; show the pixel it samples instead.
+        if (Kind == ActionKind.WaitPixel) return string.Create(CultureInfo.InvariantCulture, $"{CondX}, {CondY}");
         if (Kind is ActionKind.Key or ActionKind.Text or ActionKind.Wait) return "—";
         string pos = string.Create(CultureInfo.InvariantCulture, $"{X}, {Y}");
         return WindowRelative ? $"{pos} in {Ellipsis(WindowLabel, 24)}" : pos;
     }
+
+    /// <summary>The <see cref="CondColor"/> in <c>#RRGGBB</c> form, shared by the UI and the list.</summary>
+    public string DescribeColor() => string.Create(CultureInfo.InvariantCulture, $"#{CondColor:X6}");
 
     public string WindowLabel =>
         !string.IsNullOrEmpty(WindowTitle) ? WindowTitle :
