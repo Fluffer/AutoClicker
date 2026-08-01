@@ -284,6 +284,11 @@ internal static class UiaInvoker
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IUIAutomation
     {
+        // Explicit Bool marshalling: the default for a bool in a COM interface is the 2-byte
+        // VARIANT_BOOL, but this method returns a 4-byte Win32 BOOL. Getting it wrong would
+        // not crash — IsDesktopRoot would just quietly return the wrong answer, either
+        // letting a desktop-root invoke through or blocking a legitimate click.
+        [return: MarshalAs(UnmanagedType.Bool)]
         bool CompareElements(IUIAutomationElement? el1, IUIAutomationElement? el2);
 
         void Stub02_CompareRuntimeIds();

@@ -55,6 +55,9 @@ internal sealed class ActionEditorForm : Form
     private int pickCountdown;
     private System.Windows.Forms.Timer? pickPixelTimer;
     private int pickPixelCountdown;
+    // Second phase of the pick: cursor parked away from the target, waiting for it to
+    // repaint its resting colour before the sample is taken.
+    private bool pickPixelSettling;
 
     // Window anchoring keeps both representations so toggling the checkbox can convert
     // between them instead of throwing the coordinates away.
@@ -182,7 +185,9 @@ internal sealed class ActionEditorForm : Form
         pnlSwatch.BackColor = PixelSampler.FromRgb(action.CondColor);
         lblSwatchText.Text = action.DescribeColor();
         numTolerance.Value = action.CondTolerance;
-        lblToleranceHint.Text = "0 = exact match, higher allows more drift";
+        lblToleranceHint.Text = "0 = exact match, higher allows more drift.\r\n"
+                             + "Picking moves the cursor aside before sampling, so the colour is the\r\n"
+                             + "target's resting state rather than its hover highlight.";
         numPixelTimeout.Value = Math.Clamp(action.PixelTimeoutMs, numPixelTimeout.Minimum, numPixelTimeout.Maximum);
         chkAbortOnTimeout.Checked = action.AbortRunOnTimeout;
         numPollInterval.Value = action.PollIntervalMs;
@@ -367,27 +372,53 @@ internal sealed class ActionEditorForm : Form
     private void StartPickPixel()
     {
         pickPixelCountdown = 3;
+        pickPixelSettling = false;
         btnPickPixel.Enabled = false;
         pickPixelTimer?.Dispose();
         pickPixelTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         btnPickPixel.Text = $"{pickPixelCountdown}…";
         pickPixelTimer.Tick += (_, _) =>
         {
-            if (--pickPixelCountdown > 0) { btnPickPixel.Text = $"{pickPixelCountdown}…"; return; }
+            if (!pickPixelSettling)
+            {
+                if (--pickPixelCountdown > 0) { btnPickPixel.Text = $"{pickPixelCountdown}…"; return; }
+
+                // The coordinates come from where the user is pointing...
+                GetCursorPos(out POINT p);
+                numCondX.Value = Math.Clamp(p.X, numCondX.Minimum, numCondX.Maximum);
+                numCondY.Value = Math.Clamp(p.Y, numCondY.Minimum, numCondY.Maximum);
+
+                // ...but the COLOUR must not be sampled while the cursor is still sitting on
+                // it. Anything that highlights on hover — buttons, links, menu items, list
+                // rows — would be captured in its hover colour, which never recurs at run
+                // time when the cursor is elsewhere, so the condition could never match. A
+                // themed button measures #E0EEF9 hovered against #FDFDFD at rest: far
+                // outside any sane tolerance. Park the cursor on this dialog and let the
+                // target repaint its resting state before sampling.
+                SetCursorPos(Left + (Width / 2), Top + (Height / 2));
+                pickPixelSettling = true;
+                btnPickPixel.Text = "sampling…";
+                pickPixelTimer!.Interval = SettleMs;
+                return;
+            }
 
             pickPixelTimer!.Stop();
             pickPixelTimer.Dispose();
             pickPixelTimer = null;
+            pickPixelSettling = false;
             btnPickPixel.Text = "Pick pixel (3s)…";
             btnPickPixel.Enabled = true;
 
-            GetCursorPos(out POINT p);
-            numCondX.Value = Math.Clamp(p.X, numCondX.Minimum, numCondX.Maximum);
-            numCondY.Value = Math.Clamp(p.Y, numCondY.Minimum, numCondY.Maximum);
             UpdateColorSwatch();
         };
         pickPixelTimer.Start();
     }
+
+    /// <summary>
+    /// How long to wait after moving the cursor away before sampling. The target repaints on
+    /// its own message loop, in another process, so this only has to outlast a redraw.
+    /// </summary>
+    private const int SettleMs = 250;
 
     private void CaptureAt(POINT screenPt)
     {

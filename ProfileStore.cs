@@ -51,6 +51,27 @@ internal static class ProfileStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>
+    /// Moves an unreadable profiles file aside so a later save cannot overwrite it. Best
+    /// effort and silent: this runs on the failure path already, and a failure to preserve
+    /// must not turn into a second failure on top of the first.
+    /// </summary>
+    private static void PreserveUnreadableFile()
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return;
+            string kept = FilePath + ".corrupt";
+            // Keep every casualty rather than overwriting an earlier one.
+            for (int i = 2; File.Exists(kept) && i < 100; i++) kept = $"{FilePath}.corrupt{i}";
+            File.Move(FilePath, kept, overwrite: false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // Nothing more we can do; the caller is already told not to save.
+        }
+    }
+
     /// <summary>Where profiles are read from and written to: <c>%AppData%\AutoClicker\profiles.json</c>.</summary>
     public static string FilePath { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClicker", "profiles.json");
@@ -59,8 +80,20 @@ internal static class ProfileStore
     /// Loads profiles from <see cref="FilePath"/>. Never throws: a missing, empty, unreadable,
     /// or corrupt file yields an empty list instead of stopping the app from starting.
     /// </summary>
-    public static List<Profile> Load()
+    public static List<Profile> Load() => Load(out _);
+
+    /// <summary>
+    /// As <see cref="Load()"/>, but reports whether an existing file failed to load.
+    /// </summary>
+    /// <param name="loadFailed">
+    /// True when a file was present but could not be read or parsed. Callers MUST NOT save
+    /// over the file in that case: an empty list saved atomically over a profile collection
+    /// that merely failed to parse destroys every profile permanently. A missing file is
+    /// not a failure — that is just a fresh install.
+    /// </param>
+    public static List<Profile> Load(out bool loadFailed)
     {
+        loadFailed = false;
         List<Profile> loaded;
         try
         {
@@ -69,8 +102,17 @@ internal static class ProfileStore
                 ? new List<Profile>()
                 : JsonSerializer.Deserialize<List<Profile>>(json, JsonOptions) ?? new List<Profile>();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (FileNotFoundException) { loaded = new List<Profile>(); }
+        catch (DirectoryNotFoundException) { loaded = new List<Profile>(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or JsonException or NotSupportedException
+                                      or ArgumentException or System.Security.SecurityException)
         {
+            // The file exists but we could not use it. Preserve it under a new name before
+            // anything can overwrite it — this is the user's recorded work, and a parse
+            // error is far more likely to be a bug here than genuinely lost data.
+            loadFailed = true;
+            PreserveUnreadableFile();
             loaded = new List<Profile>();
         }
 
@@ -107,13 +149,19 @@ internal static class ProfileStore
             string? dir = Path.GetDirectoryName(FilePath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-            string tempPath = FilePath + ".tmp";
+            // Per-process temp name: the GUI and a CLI run can both be saving, and a shared
+            // "profiles.json.tmp" would let one truncate the file the other is mid-write on.
+            string tempPath = $"{FilePath}.{Environment.ProcessId}.tmp";
             File.WriteAllText(tempPath, JsonSerializer.Serialize(profiles, JsonOptions));
             File.Move(tempPath, FilePath, overwrite: true);
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or NotSupportedException or JsonException
+                                      or ArgumentException or System.Security.SecurityException)
         {
+            // JsonException belongs here too: serialization failing must return false like
+            // any other write failure, not escape a method documented as never throwing.
             return false;
         }
     }

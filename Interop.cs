@@ -1,6 +1,13 @@
 using System.Runtime.InteropServices;
 using System.Text;
 
+// Every P/Invoke in this app resolves to a System32 library (user32, kernel32, gdi32,
+// winmm, ole32). Pinning the search path there closes the DLL-planting angle where a
+// same-named DLL dropped next to the executable would be loaded in preference — which
+// matters more than usual here, because this app synthesizes input and is the kind of
+// thing people download as a loose .exe.
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+
 namespace AutoClicker;
 
 /// <summary>

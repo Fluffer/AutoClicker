@@ -327,7 +327,20 @@ internal static class CliRunner
             error = $"Option '{flag}' requires a value.";
             return false;
         }
-        value = args[++i];
+
+        // Refuse to swallow the next flag as this one's value. "--run --list" would
+        // otherwise set the filename to "--list" and never process --list at all, failing
+        // later with a confusing "file not found" naming something the user never typed.
+        string candidate = args[i + 1];
+        if (candidate.StartsWith("--", StringComparison.Ordinal))
+        {
+            value = null;
+            error = $"Option '{flag}' requires a value, but was followed by '{candidate}'.";
+            return false;
+        }
+
+        value = candidate;
+        i++;
         error = null;
         return true;
     }

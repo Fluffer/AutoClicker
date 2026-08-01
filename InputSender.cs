@@ -80,13 +80,13 @@ internal static class InputSender
 
     // ---- Clicking ----
 
-    public static void Click(int button, bool dbl, int holdMs = 0)
+    public static void Click(int button, bool dbl, int holdMs = 0, Func<bool>? keepGoing = null)
     {
         var (down, up) = MouseFlags(button);
         Send(new[] { Mouse(down) });
         try
         {
-            if (holdMs > 0) Thread.Sleep(holdMs);
+            HoldFor(holdMs, keepGoing);
         }
         finally
         {
@@ -140,16 +140,41 @@ internal static class InputSender
         }
     }
 
+    /// <summary>
+    /// Sleeps for a click's hold time in short slices, checking <paramref name="keepGoing"/>
+    /// between them. A single Thread.Sleep(holdMs) would make Stop and the panic key wait out
+    /// the whole hold — the only blocking path in the engine that ignored a stop request.
+    /// </summary>
+    private static void HoldFor(int holdMs, Func<bool>? keepGoing)
+    {
+        if (holdMs <= 0) return;
+        if (keepGoing is null) { Thread.Sleep(holdMs); return; }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (keepGoing())
+        {
+            long left = holdMs - sw.ElapsedMilliseconds;
+            if (left <= 0) return;
+            Thread.Sleep((int)Math.Min(10, left));
+        }
+    }
+
     /// <summary>Posts click messages to the window under a screen point; cursor never moves.</summary>
-    public static void BackgroundClick(int screenX, int screenY, int button, bool dbl, int holdMs = 0)
+    public static void BackgroundClick(int screenX, int screenY, int button, bool dbl, int holdMs = 0, Func<bool>? keepGoing = null)
     {
         if (!TargetAt(screenX, screenY, out IntPtr hwnd, out POINT cp)) return;
         var (down, up, dblMsg, mk) = MessageFlags(button);
         IntPtr lParam = MakeLParam(cp.X, cp.Y);
 
         PostMessage(hwnd, down, (IntPtr)mk, lParam);
-        if (holdMs > 0) Thread.Sleep(holdMs);
-        PostMessage(hwnd, up, IntPtr.Zero, lParam);
+        try
+        {
+            HoldFor(holdMs, keepGoing);
+        }
+        finally
+        {
+            PostMessage(hwnd, up, IntPtr.Zero, lParam);
+        }
 
         if (dbl)
         {
@@ -216,12 +241,19 @@ internal static class InputSender
         var (down, up, _, mk) = MessageFlags(button);
 
         PostMessage(hwnd, down, (IntPtr)mk, MakeLParam(start.X, start.Y));
+
+        // The release goes in a finally, not a catch. An early return is not an exception,
+        // so a catch would let the ScreenToClient bail-out below post DOWN and never post
+        // UP — leaving the target application believing the button is still held, with no
+        // physical button stuck for the user to notice and clear.
+        POINT release = start;
         try
         {
             // The end point is mapped into the SAME window: a drag that crosses a window
             // boundary still belongs to the window that captured the mouse.
             var endScreen = new POINT { X = x2, Y = y2 };
             if (!ScreenToClient(hwnd, ref endScreen)) return;
+            release = endScreen;
 
             int steps = Math.Clamp(dragMs / 10, 8, 200);
             int stepMs = Math.Max(0, dragMs / steps);
@@ -231,12 +263,10 @@ internal static class InputSender
                     MakeLParam(Lerp(start.X, endScreen.X, s, steps), Lerp(start.Y, endScreen.Y, s, steps)));
                 if (stepMs > 0) Thread.Sleep(stepMs);
             }
-            PostMessage(hwnd, up, IntPtr.Zero, MakeLParam(endScreen.X, endScreen.Y));
         }
-        catch
+        finally
         {
-            PostMessage(hwnd, up, IntPtr.Zero, MakeLParam(start.X, start.Y));
-            throw;
+            PostMessage(hwnd, up, IntPtr.Zero, MakeLParam(release.X, release.Y));
         }
     }
 

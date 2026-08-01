@@ -198,8 +198,10 @@ internal sealed class SequenceRunner
                     // surprised that none of that took effect.
                     UiaInvoker.TryInvokeAt(x, y, out _);
                 }
-                else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs);
-                else { SetCursorPos(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs); }
+                // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
+                // panic key wait out the whole hold before taking effect.
+                else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+                else { SetCursorPos(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
                 break;
 
             case ActionKind.Drag:

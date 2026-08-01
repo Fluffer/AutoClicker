@@ -73,6 +73,10 @@ public partial class Form1 : Form
     // profile list after New/Rename/Duplicate/Delete) from re-entering the same handlers
     // that respond to the user's own selections.
     private bool suppressProfileEvents;
+    // Set when profiles.json existed but could not be read. Every save is then refused for
+    // the session: writing an empty collection over a file that merely failed to parse
+    // would destroy the user's saved sequences permanently.
+    private bool profilesLoadFailed;
     private readonly List<int> registeredProfileHotkeyIds = new();
 
     // recording (low-level mouse hook)
@@ -938,13 +942,28 @@ public partial class Form1 : Form
 
     // ---- Profiles ----
 
+    /// <summary>
+    /// Single gate for every profile write. Refuses to save when the file failed to load,
+    /// so a parse error can never be promoted into permanent data loss by the next save.
+    /// </summary>
+    private void SaveProfiles()
+    {
+        if (profilesLoadFailed) return;
+        ProfileStore.Save(profiles);
+    }
+
     // Restores profiles.json and whichever profile (if any) was active last session,
     // without letting the combo box / checkbox events fire mid-restore against state
     // that isn't fully loaded yet. Hotkey registration is deliberately left to
     // OnHandleCreated — see the comment there.
     private void RestoreProfiles()
     {
-        profiles = ProfileStore.Load();
+        profiles = ProfileStore.Load(out profilesLoadFailed);
+        if (profilesLoadFailed)
+        {
+            lblStatus.Text = "Could not read profiles.json — it has been kept as profiles.json.corrupt\r\n"
+                           + "and profile saving is disabled this session so it can't be overwritten.";
+        }
 
         suppressProfileEvents = true;
         try
@@ -1003,7 +1022,7 @@ public partial class Form1 : Form
     {
         if (index < 0 || index >= profiles.Count) return;
         profiles[index].Actions = points.Select(a => a.Clone()).ToList();
-        ProfileStore.Save(profiles);
+        SaveProfiles();
     }
 
     private void CmbProfile_SelectedIndexChanged(object? sender, EventArgs e)
@@ -1046,7 +1065,7 @@ public partial class Form1 : Form
         string unique = ProfileStore.UniqueName(profiles, string.IsNullOrWhiteSpace(name) ? "Profile" : name.Trim());
         var p = new Profile { Name = unique };
         profiles.Add(p);
-        ProfileStore.Save(profiles);
+        SaveProfiles();
 
         activeProfileIndex = profiles.Count - 1;
         RefreshProfileCombo(unique);
@@ -1069,7 +1088,7 @@ public partial class Form1 : Form
         string desired = string.IsNullOrWhiteSpace(name) ? p.Name : name.Trim();
         string unique = ProfileStore.UniqueName(profiles.Where(x => x != p), desired);
         p.Name = unique;
-        ProfileStore.Save(profiles);
+        SaveProfiles();
 
         settings.ActiveProfileName = unique;
         RefreshProfileCombo(unique);
@@ -1088,7 +1107,7 @@ public partial class Form1 : Form
         string unique = ProfileStore.UniqueName(profiles, source.Name + " (copy)");
         var copy = new Profile { Name = unique, Actions = source.Actions.Select(a => a.Clone()).ToList() };
         profiles.Add(copy);
-        ProfileStore.Save(profiles);
+        SaveProfiles();
 
         activeProfileIndex = profiles.Count - 1;
         RefreshProfileCombo(unique);
@@ -1111,7 +1130,7 @@ public partial class Form1 : Form
         if (result != DialogResult.Yes) return;
 
         profiles.RemoveAt(activeProfileIndex);
-        ProfileStore.Save(profiles);
+        SaveProfiles();
         activeProfileIndex = -1; // the deleted index no longer refers to anything
 
         string? nextName = profiles.Count > 0 ? profiles[0].Name : null;
@@ -1198,7 +1217,7 @@ public partial class Form1 : Form
         Profile p = profiles[activeProfileIndex];
         p.HotkeyVk = vk;
         p.HotkeyName = vk == 0 ? "" : "F" + sel;
-        ProfileStore.Save(profiles);
+        SaveProfiles();
         RegisterProfileHotkeys();
         lblStatus.Text = vk == 0 ? $"Removed hotkey from \"{p.Name}\"." : $"\"{p.Name}\" now runs on F{sel}.";
     }
@@ -1544,15 +1563,28 @@ public partial class Form1 : Form
     private void RunSingleWorker(SingleRunOptions options)
     {
         try { runner.RunSingle(options); }
-        catch (Exception ex) { ReportError(ex); }
+        catch (Exception ex) { ReleaseAfterFailure(ex); }
         finally { Finish(); }
     }
 
     private void RunSequenceWorker(List<SeqAction> acts, RunOptions options)
     {
         try { runner.RunSequence(acts, options); }
-        catch (Exception ex) { ReportError(ex); }
+        catch (Exception ex) { ReleaseAfterFailure(ex); }
         finally { Finish(); }
+    }
+
+    /// <summary>
+    /// A run that ended by throwing may have died between a button-down and its matching
+    /// up — an elevated foreground window makes the release itself throw, for instance.
+    /// Release everything before reporting, so a failed run can't leave a button held.
+    /// The CLI already does this unconditionally; the GUI previously relied on the user
+    /// noticing and hitting the panic key.
+    /// </summary>
+    private void ReleaseAfterFailure(Exception ex)
+    {
+        InputSender.ReleaseAllButtons();
+        ReportError(ex);
     }
 
     // Fires just before a step is attempted — including one that then blocks for a while (a
