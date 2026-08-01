@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -82,6 +84,25 @@ public partial class Form1 : Form
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandle(string? name);
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    private static extern uint TimeBeginPeriod(uint ms);
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    private static extern uint TimeEndPeriod(uint ms);
+
+    private const uint TIMERR_NOERROR = 0;
+
+    // Without this, Thread.Sleep(1) actually sleeps ~15.6 ms, capping the click rate
+    // around 64/s no matter what interval the user asked for.
+    private sealed class TimerResolutionScope : IDisposable
+    {
+        private readonly bool raised;
+        public TimerResolutionScope() => raised = TimeBeginPeriod(1) == TIMERR_NOERROR;
+        public void Dispose()
+        {
+            if (raised && TimeEndPeriod(1) != TIMERR_NOERROR)
+                Debug.WriteLine("timeEndPeriod(1) failed");
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
@@ -122,6 +143,7 @@ public partial class Form1 : Form
     private List<SeqPoint> points = new();
     private Thread? worker;
     private volatile bool running;
+    private int busy; // 0 = idle, 1 = a worker owns the engine. Guards start/stop overlap.
     private uint hotkeyVk = 0x75; // F6
     private string hotkeyName = "F6";
     private System.Windows.Forms.Timer? pickTimer;
@@ -251,8 +273,10 @@ public partial class Form1 : Form
         rbPick.CheckedChanged += (_, _) => UpdateEnabled();
         btnPick = new Button { Text = "Pick location", AutoSize = true, Margin = new Padding(3) };
         btnPick.Click += BtnPick_Click;
-        numX = NewNum(0, 100000, 0); numX.Width = 80;
-        numY = NewNum(0, 100000, 0); numY.Width = 80;
+        // Negative coordinates are legal: a secondary monitor placed left of / above the
+        // primary one lives at negative virtual-screen coordinates.
+        numX = NewNum(-100000, 100000, 0); numX.Width = 80;
+        numY = NewNum(-100000, 100000, 0); numY.Width = 80;
         flow.Controls.Add(rbCurrent);
         flow.Controls.Add(rbPick);
         flow.Controls.Add(btnPick);
@@ -530,6 +554,11 @@ public partial class Form1 : Form
         {
             var loaded = JsonSerializer.Deserialize<List<SeqPoint>>(File.ReadAllText(ofd.FileName));
             if (loaded == null) { lblStatus.Text = "Load failed: empty file."; return; }
+            foreach (var p in loaded)
+            {
+                p.Button = Math.Clamp(p.Button, 0, 2);
+                p.DelayMs = Math.Max(0, p.DelayMs);
+            }
             points = loaded;
             RefreshList();
             chkSequence.Checked = points.Count > 0;
@@ -586,7 +615,9 @@ public partial class Form1 : Form
                 {
                     return CallNextHookEx(mouseHook, nCode, wParam, lParam);
                 }
-                BeginInvoke(() => AddPoint(pt));
+                // Re-check `recording` on the UI thread: BeginInvoke is async, so recording
+                // may already have been stopped by the time this runs.
+                BeginInvoke(() => { if (recording) AddPoint(pt); });
                 return (IntPtr)1; // swallow so the target isn't actually clicked during recording
             }
         }
@@ -600,8 +631,8 @@ public partial class Form1 : Form
         StartPick(() =>
         {
             GetCursorPos(out POINT p);
-            numX.Value = Math.Clamp(p.X, 0, (int)numX.Maximum);
-            numY.Value = Math.Clamp(p.Y, 0, (int)numY.Maximum);
+            numX.Value = Math.Clamp(p.X, (int)numX.Minimum, (int)numX.Maximum);
+            numY.Value = Math.Clamp(p.Y, (int)numY.Minimum, (int)numY.Maximum);
             lblStatus.Text = $"Captured X={p.X} Y={p.Y}.";
             UpdateEnabled();
         });
@@ -661,8 +692,14 @@ public partial class Form1 : Form
     {
         UnregisterHotKey(Handle, HOTKEY_TOGGLE);
         UnregisterHotKey(Handle, HOTKEY_RECEND);
-        RegisterHotKey(Handle, HOTKEY_TOGGLE, 0, hotkeyVk);
-        if (hotkeyVk != VK_F8) RegisterHotKey(Handle, HOTKEY_RECEND, 0, VK_F8);
+        bool okToggle = RegisterHotKey(Handle, HOTKEY_TOGGLE, 0, hotkeyVk);
+        bool okRecEnd = hotkeyVk == VK_F8 || RegisterHotKey(Handle, HOTKEY_RECEND, 0, VK_F8);
+
+        if (lblStatus is null) return; // handle can be created before BuildUi finishes
+        if (!okToggle)
+            lblStatus.Text = $"{hotkeyName} is already claimed by another app — global hotkey OFF.\r\nUse the Start/Stop buttons, or pick a different key.";
+        else if (!okRecEnd)
+            lblStatus.Text = $"Ready. Press {hotkeyName} to start/stop. (F8 is taken — right-click ends recording.)";
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -675,6 +712,17 @@ public partial class Form1 : Form
     {
         running = false;
         if (recording) StopRecording();
+
+        pickTimer?.Stop();
+        pickTimer?.Dispose();
+        pickTimer = null;
+        pickDone = null;
+
+        // Wait for the worker to unwind. The worker is a background thread, so without this
+        // the process can exit mid-"hold" and leave the mouse button physically stuck down.
+        // It polls `running` every <= 20 ms, so this returns almost immediately.
+        worker?.Join(2000);
+
         UnregisterHotKey(Handle, HOTKEY_TOGGLE);
         UnregisterHotKey(Handle, HOTKEY_RECEND);
         base.OnFormClosing(e);
@@ -717,20 +765,37 @@ public partial class Form1 : Form
         _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
     };
 
-    private static void SendMouse(uint flags)
+    private static bool SendMouse(uint flags)
     {
         var inp = new INPUT[1];
         inp[0].type = INPUT_MOUSE;
         inp[0].mi.dwFlags = flags;
-        _ = SendInput(1, inp, Marshal.SizeOf<INPUT>());
+        return SendInput(1, inp, Marshal.SizeOf<INPUT>()) != 0;
+    }
+
+    private static void SendMouseChecked(uint flags)
+    {
+        if (!SendMouse(flags))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "SendInput was blocked. The target window is probably running elevated — restart Auto Clicker as administrator.");
     }
 
     private static void DoClick(int button, bool dbl)
     {
         var (down, up) = ButtonFlags(button);
-        SendMouse(down);
+        SendMouseChecked(down);
         SendMouse(up);
         if (dbl) { Thread.Sleep(15); SendMouse(down); SendMouse(up); }
+    }
+
+    // MAKELPARAM. Masking both halves to 16 bits matters on x64: packing a negative
+    // coordinate the naive way sign-extends and fills the whole upper dword with 1s.
+    private static IntPtr MakeLParam(int x, int y)
+    {
+        long packed = ((long)(y & 0xFFFF) << 16) | (uint)(x & 0xFFFF);
+#pragma warning disable CA2020 // deliberate wrap-around: MAKELPARAM is a 32-bit bit-packing
+        return unchecked((IntPtr)packed);
+#pragma warning restore CA2020
     }
 
     // Background click: post messages to the window under the point, no cursor move.
@@ -740,8 +805,8 @@ public partial class Form1 : Form
         IntPtr hwnd = WindowFromPoint(sp);
         if (hwnd == IntPtr.Zero) return;
         var cp = sp;
-        ScreenToClient(hwnd, ref cp);
-        IntPtr lParam = (IntPtr)((cp.Y << 16) | (cp.X & 0xFFFF));
+        if (!ScreenToClient(hwnd, ref cp)) return;
+        IntPtr lParam = MakeLParam(cp.X, cp.Y);
         (uint down, uint up, uint dbclk, int mk) = button switch
         {
             1 => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON),
@@ -757,16 +822,33 @@ public partial class Form1 : Form
         }
     }
 
+    // Waits `ms`, but bails out early once `running` goes false.
+    // Measured against a Stopwatch rather than by accumulating fixed steps: the old
+    // "sleep 25 ms until you've slept enough" loop overshot every interval that wasn't
+    // a multiple of 25 (a 30 ms interval actually waited 50 ms).
     private void InterruptibleSleep(int ms)
     {
-        if (ms <= 0) { Thread.Sleep(1); return; }
-        int slept = 0, step = Math.Min(25, ms);
-        while (running && slept < ms) { Thread.Sleep(step); slept += step; }
+        if (ms <= 0) return; // 0 means "as fast as possible", not "sleep a tick"
+        var sw = Stopwatch.StartNew();
+        while (running)
+        {
+            long left = ms - sw.ElapsedMilliseconds;
+            if (left <= 0) return;
+            if (left > 20) Thread.Sleep(10);   // coarse; keeps stop latency <= 10 ms
+            else if (left > 2) Thread.Sleep(1);
+            else Thread.SpinWait(100);         // final approach, Sleep is too granular here
+        }
     }
 
     private void StartClicking()
     {
-        if (running || recording) return;
+        if (recording) return;
+
+        // Claim the engine. `running` alone is not enough: after Stop, the previous worker
+        // is still unwinding and its finally-block sets running = false — which would
+        // immediately kill a run started in that window. busy is only released by Finish(),
+        // once the old worker is genuinely done.
+        if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
 
         bool seq = chkSequence.Checked && points.Count > 0;
         bool limited = rbRepeatN.Checked;
@@ -795,20 +877,34 @@ public partial class Form1 : Form
                                   : $"Clicking... press {hotkeyName} to stop.";
             worker = new Thread(() => RunSingle(hold, dbl, button, useFixedPos, px, py, interval, limited && !hold, limit)) { IsBackground = true };
         }
-        worker.Start();
+
+        try
+        {
+            worker.Start();
+        }
+        catch (Exception ex)
+        {
+            running = false;
+            Interlocked.Exchange(ref busy, 0);
+            OnStopped();
+            lblStatus.Text = "Could not start: " + ex.Message;
+        }
     }
 
     private void RunSingle(bool hold, bool dbl, int button, bool useFixedPos, int px, int py, int interval, bool limited, int limit)
     {
+        using var timerRes = new TimerResolutionScope();
         try
         {
             if (useFixedPos) SetCursorPos(px, py);
             var (down, up) = ButtonFlags(button);
             if (hold)
             {
-                SendMouse(down);
-                while (running) Thread.Sleep(20);
-                SendMouse(up);
+                SendMouseChecked(down);
+                // The release MUST happen on every exit path, including an exception or a
+                // close mid-hold — otherwise the button stays physically down system-wide.
+                try { while (running) Thread.Sleep(20); }
+                finally { SendMouse(up); }
             }
             else
             {
@@ -823,12 +919,13 @@ public partial class Form1 : Form
                 }
             }
         }
-        catch { }
+        catch (Exception ex) { ReportError(ex); }
         finally { Finish(); }
     }
 
     private void RunSequence(List<SeqPoint> pts, bool background, bool limited, int limit)
     {
+        using var timerRes = new TimerResolutionScope();
         try
         {
             int pass = 0;
@@ -853,28 +950,50 @@ public partial class Form1 : Form
                 if (limited && pass >= limit) break;
             }
         }
-        catch { }
+        catch (Exception ex) { ReportError(ex); }
         finally { Highlight(-1); Finish(); }
+    }
+
+    // Surfaces worker-thread failures instead of swallowing them.
+    private void ReportError(Exception ex)
+    {
+        if (!IsHandleCreated) return;
+        try { BeginInvoke(() => lblStatus.Text = "Stopped — " + ex.Message); }
+        catch (ObjectDisposedException) { /* form closed while we were unwinding */ }
+        catch (InvalidOperationException) { /* handle destroyed between the check and the post */ }
     }
 
     private void Highlight(int index)
     {
         if (!IsHandleCreated) return;
-        BeginInvoke(() =>
+        try
         {
-            foreach (ListViewItem it in lvPoints.Items) it.BackColor = lvPoints.BackColor;
-            if (index >= 0 && index < lvPoints.Items.Count)
+            BeginInvoke(() =>
             {
-                lvPoints.Items[index].BackColor = Color.FromArgb(255, 230, 160);
-                lvPoints.Items[index].EnsureVisible();
-            }
-        });
+                foreach (ListViewItem it in lvPoints.Items) it.BackColor = lvPoints.BackColor;
+                if (index >= 0 && index < lvPoints.Items.Count)
+                {
+                    lvPoints.Items[index].BackColor = Color.FromArgb(255, 230, 160);
+                    lvPoints.Items[index].EnsureVisible();
+                }
+            });
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
     }
 
     private void Finish()
     {
         running = false;
-        if (IsHandleCreated) BeginInvoke(OnStopped);
+        if (IsHandleCreated)
+        {
+            try { BeginInvoke(OnStopped); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+        // Released last: StartClicking must not be able to claim the engine until this
+        // worker has finished touching `running`.
+        Interlocked.Exchange(ref busy, 0);
     }
 
     private void StopClicking() => running = false;
