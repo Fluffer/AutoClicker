@@ -1,128 +1,16 @@
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using static AutoClicker.Native;
 
 namespace AutoClicker;
 
 public partial class Form1 : Form
 {
-    // ---- Win32 interop ----
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT { public int X; public int Y; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MOUSEINPUT
-    {
-        public int dx;
-        public int dy;
-        public uint mouseData;
-        public uint dwFlags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct INPUT
-    {
-        public uint type;
-        public MOUSEINPUT mi;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MSLLHOOKSTRUCT
-    {
-        public POINT pt;
-        public uint mouseData;
-        public uint flags;
-        public uint time;
-        public UIntPtr dwExtraInfo;
-    }
-
-    private const uint INPUT_MOUSE = 0;
-    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
-    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
-    private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-    private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
-    private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
-    private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
-
-    // window messages for background (PostMessage) clicking
-    private const uint WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203;
-    private const uint WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_RBUTTONDBLCLK = 0x0206;
-    private const uint WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MBUTTONDBLCLK = 0x0209;
-    private const int MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002, MK_MBUTTON = 0x0010;
-
-    private const int WH_MOUSE_LL = 14;
-    private const int WM_LBUTTONDOWN_LL = 0x0201;
-    private const int WM_RBUTTONDOWN_LL = 0x0204;
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-    [DllImport("user32.dll")]
-    private static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")]
-    private static extern bool GetCursorPos(out POINT lpPoint);
-    [DllImport("user32.dll")]
-    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-    [DllImport("user32.dll")]
-    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-    [DllImport("user32.dll")]
-    private static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
-    [DllImport("user32.dll")]
-    private static extern IntPtr WindowFromPoint(POINT p);
-    [DllImport("user32.dll")]
-    private static extern bool ScreenToClient(IntPtr hWnd, ref POINT p);
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
-    [DllImport("user32.dll")]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-    [DllImport("user32.dll")]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr GetModuleHandle(string? name);
-    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
-    private static extern uint TimeBeginPeriod(uint ms);
-    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
-    private static extern uint TimeEndPeriod(uint ms);
-
-    private const uint TIMERR_NOERROR = 0;
-
-    // Without this, Thread.Sleep(1) actually sleeps ~15.6 ms, capping the click rate
-    // around 64/s no matter what interval the user asked for.
-    private sealed class TimerResolutionScope : IDisposable
-    {
-        private readonly bool raised;
-        public TimerResolutionScope() => raised = TimeBeginPeriod(1) == TIMERR_NOERROR;
-        public void Dispose()
-        {
-            if (raised && TimeEndPeriod(1) != TIMERR_NOERROR)
-                Debug.WriteLine("timeEndPeriod(1) failed");
-        }
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT { public int Left, Top, Right, Bottom; }
-
-    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-    private const int WM_HOTKEY = 0x0312;
     private const int HOTKEY_TOGGLE = 0xB001;
     private const int HOTKEY_RECEND = 0xB002;
     private const uint VK_F8 = 0x77;
-
-    // ---- A point in a click sequence (JSON-serializable) ----
-    public sealed class SeqPoint
-    {
-        public int X { get; set; }
-        public int Y { get; set; }
-        public int Button { get; set; }   // 0 left, 1 right, 2 middle
-        public bool DoubleClick { get; set; }
-        public int DelayMs { get; set; }  // wait AFTER this click, before next point
-    }
 
     // ---- Controls ----
     private NumericUpDown numHours = null!, numMins = null!, numSecs = null!, numMs = null!;
@@ -132,15 +20,16 @@ public partial class Form1 : Form
     private RadioButton rbCurrent = null!, rbPick = null!;
     private Button btnPick = null!;
     private NumericUpDown numX = null!, numY = null!;
-    private CheckBox chkSequence = null!, chkBackground = null!;
+    private NumericUpDown numJitterPx = null!, numJitterPct = null!;
+    private CheckBox chkSequence = null!, chkBackground = null!, chkAnchorPoints = null!;
     private ListView lvPoints = null!;
-    private Button btnRecord = null!, btnAddCur = null!, btnEdit = null!, btnRemovePoint = null!, btnClearPoints = null!;
+    private Button btnRecord = null!, btnAddCur = null!, btnAddAction = null!, btnEdit = null!, btnRemovePoint = null!, btnClearPoints = null!;
     private Button btnUp = null!, btnDown = null!, btnSave = null!, btnLoad = null!;
     private Button btnStart = null!, btnStop = null!, btnHotkey = null!;
     private Label lblStatus = null!;
 
     // ---- State ----
-    private List<SeqPoint> points = new();
+    private List<SeqAction> points = new();
     private Thread? worker;
     private volatile bool running;
     private int busy; // 0 = idle, 1 = a worker owns the engine. Guards start/stop overlap.
@@ -163,7 +52,9 @@ public partial class Form1 : Form
     private void BuildUi()
     {
         Text = "Auto Clicker";
-        try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
+        try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); }
+        catch (ArgumentException) { }
+        catch (IOException) { }
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -186,7 +77,7 @@ public partial class Form1 : Form
 
         root.Controls.Add(BuildIntervalGroup());
         root.Controls.Add(BuildOptionsRepeatRow());
-        root.Controls.Add(BuildCursorGroup());
+        root.Controls.Add(BuildCursorHumanizeRow());
         root.Controls.Add(BuildSequenceGroup());
         root.Controls.Add(BuildButtonsRow());
 
@@ -262,7 +153,17 @@ public partial class Form1 : Form
         return row;
     }
 
-    // ===== Cursor position =====
+    // ===== Cursor position + Humanize side by side =====
+    private TableLayoutPanel BuildCursorHumanizeRow()
+    {
+        var row = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0) };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.Controls.Add(BuildCursorGroup(), 0, 0);
+        row.Controls.Add(BuildHumanizeGroup(), 1, 0);
+        return row;
+    }
+
     private GroupBox BuildCursorGroup()
     {
         var grp = NewGroup("Cursor position (single-point mode)");
@@ -288,22 +189,47 @@ public partial class Form1 : Form
         return grp;
     }
 
-    // ===== Click sequence (multiple points) =====
+    // ===== Humanize (randomised position / timing) =====
+    private GroupBox BuildHumanizeGroup()
+    {
+        var grp = NewGroup("Humanize");
+        var t = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3, Dock = DockStyle.Fill };
+        t.Controls.Add(Lbl("Position jitter:"), 0, 0);
+        numJitterPx = NewNum(0, 500, 0);
+        t.Controls.Add(numJitterPx, 1, 0);
+        t.Controls.Add(Lbl("± px"), 2, 0);
+        t.Controls.Add(Lbl("Timing jitter:"), 0, 1);
+        numJitterPct = NewNum(0, 100, 0);
+        t.Controls.Add(numJitterPct, 1, 1);
+        t.Controls.Add(Lbl("± %"), 2, 1);
+        var hint = Lbl("0 = perfectly regular. Applies to clicks and waits.");
+        hint.ForeColor = Color.DimGray;
+        t.Controls.Add(hint, 0, 2);
+        t.SetColumnSpan(hint, 3);
+        grp.Controls.Add(t);
+        return grp;
+    }
+
+    // ===== Click sequence (multiple actions) =====
     private GroupBox BuildSequenceGroup()
     {
-        var grp = NewGroup("Click sequence (multiple points)");
+        var grp = NewGroup("Sequence (clicks, drags, scrolls, keystrokes)");
         var t = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        chkSequence = new CheckBox { Text = "Use point sequence (clicks each point in order, then repeats)", AutoSize = true, Margin = new Padding(3, 3, 3, 3) };
+        chkSequence = new CheckBox { Text = "Use sequence (runs each action in order, then repeats)", AutoSize = true, Margin = new Padding(3, 3, 3, 3) };
         chkSequence.CheckedChanged += (_, _) => UpdateEnabled();
         t.Controls.Add(chkSequence, 0, 0);
         t.SetColumnSpan(chkSequence, 2);
 
-        chkBackground = new CheckBox { Text = "Background mode — send clicks to the window under each point, don't move my cursor (experimental)", AutoSize = true, Margin = new Padding(3, 0, 3, 6) };
+        chkBackground = new CheckBox { Text = "Background mode — send input to the window under each point, don't move my cursor (experimental)", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
         t.Controls.Add(chkBackground, 0, 1);
         t.SetColumnSpan(chkBackground, 2);
+
+        chkAnchorPoints = new CheckBox { Text = "Anchor new points to their window — survives the window being moved or reopened", AutoSize = true, Margin = new Padding(3, 0, 3, 6) };
+        t.Controls.Add(chkAnchorPoints, 0, 2);
+        t.SetColumnSpan(chkAnchorPoints, 2);
 
         lvPoints = new ListView
         {
@@ -311,25 +237,25 @@ public partial class Form1 : Form
             FullRowSelect = true,
             GridLines = true,
             HideSelection = false,
-            Width = 420,
-            Height = 180,
+            Width = 500,
+            Height = 200,
             Margin = new Padding(3)
         };
         lvPoints.Columns.Add("#", 30);
-        lvPoints.Columns.Add("X", 60);
-        lvPoints.Columns.Add("Y", 60);
-        lvPoints.Columns.Add("Button", 70);
-        lvPoints.Columns.Add("Type", 70);
-        lvPoints.Columns.Add("Wait ms", 90);
+        lvPoints.Columns.Add("Action", 190);
+        lvPoints.Columns.Add("Target", 200);
+        lvPoints.Columns.Add("Wait ms", 70);
         lvPoints.DoubleClick += (_, _) => EditSelectedPoint();
-        t.Controls.Add(lvPoints, 0, 2);
+        t.Controls.Add(lvPoints, 0, 3);
 
         var btns = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(6, 3, 3, 3) };
         btnRecord = SeqBtn("● Record clicks");
         btnRecord.Click += (_, _) => ToggleRecording();
         btnAddCur = SeqBtn("Add cursor pos");
         btnAddCur.Click += (_, _) => AddPoint(CursorPos());
-        btnEdit = SeqBtn("Edit point…");
+        btnAddAction = SeqBtn("Add action…");
+        btnAddAction.Click += (_, _) => AddCustomAction();
+        btnEdit = SeqBtn("Edit…");
         btnEdit.Click += (_, _) => EditSelectedPoint();
         btnRemovePoint = SeqBtn("Remove");
         btnRemovePoint.Click += (_, _) => RemoveSelectedPoint();
@@ -337,10 +263,11 @@ public partial class Form1 : Form
         btnClearPoints.Click += (_, _) => { points.Clear(); RefreshList(); };
         btns.Controls.Add(btnRecord);
         btns.Controls.Add(btnAddCur);
+        btns.Controls.Add(btnAddAction);
         btns.Controls.Add(btnEdit);
         btns.Controls.Add(btnRemovePoint);
         btns.Controls.Add(btnClearPoints);
-        t.Controls.Add(btns, 1, 2);
+        t.Controls.Add(btns, 1, 3);
 
         var bottom = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0, 2, 0, 2) };
         btnUp = SeqBtn("Move up ▲");
@@ -355,12 +282,13 @@ public partial class Form1 : Form
         bottom.Controls.Add(btnDown);
         bottom.Controls.Add(btnSave);
         bottom.Controls.Add(btnLoad);
-        t.Controls.Add(bottom, 0, 3);
+        t.Controls.Add(bottom, 0, 4);
         t.SetColumnSpan(bottom, 2);
 
-        var hint = Lbl("Record: click each target (right-click or F8 to finish). Double-click a row to edit X/Y/button/type/wait.");
+        var hint = Lbl("Record: click each target (right-click or F8 to finish). Double-click a row to edit it. "
+                     + "\"Add action…\" adds drags, scroll and keystrokes.");
         hint.ForeColor = Color.DimGray;
-        t.Controls.Add(hint, 0, 4);
+        t.Controls.Add(hint, 0, 5);
         t.SetColumnSpan(hint, 2);
 
         grp.Controls.Add(t);
@@ -434,17 +362,47 @@ public partial class Form1 : Form
     // ---- Sequence list ----
     private void AddPoint(POINT p)
     {
-        points.Add(new SeqPoint
+        var a = new SeqAction
         {
+            Kind = ActionKind.Click,
             X = p.X,
             Y = p.Y,
             Button = cmbButton.SelectedIndex,
             DoubleClick = cmbType.SelectedIndex == 1,
             DelayMs = IntervalMs()
-        });
+        };
+
+        if (chkAnchorPoints.Checked &&
+            WindowAnchor.Capture(p, out string cls, out string title, out POINT clientPt))
+        {
+            a.WindowRelative = true;
+            a.WindowClass = cls;
+            a.WindowTitle = title;
+            a.X = clientPt.X;
+            a.Y = clientPt.Y;
+        }
+
+        points.Add(a);
         RefreshList();
         if (!chkSequence.Checked) chkSequence.Checked = true;
-        lblStatus.Text = $"Added point #{points.Count}: X={p.X} Y={p.Y}";
+        lblStatus.Text = $"Added action #{points.Count}: {a.Describe()} at {a.DescribeTarget()}";
+    }
+
+    private void AddCustomAction()
+    {
+        var seed = new SeqAction { DelayMs = IntervalMs(), Button = cmbButton.SelectedIndex };
+        var cur = CursorPos();
+        seed.X = cur.X;
+        seed.Y = cur.Y;
+
+        using var dlg = new ActionEditorForm(seed, "Add action");
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        points.Add(dlg.Result);
+        RefreshList();
+        if (!chkSequence.Checked) chkSequence.Checked = true;
+        lvPoints.Items[^1].Selected = true;
+        lblStatus.Text = $"Added action #{points.Count}: {dlg.Result.Describe()}";
     }
 
     private void RemoveSelectedPoint()
@@ -474,60 +432,27 @@ public partial class Form1 : Form
         for (int i = 0; i < points.Count; i++)
         {
             var p = points[i];
-            string btn = p.Button switch { 1 => "Right", 2 => "Middle", _ => "Left" };
             var item = new ListViewItem((i + 1).ToString(CultureInfo.InvariantCulture));
-            item.SubItems.Add(p.X.ToString(CultureInfo.InvariantCulture));
-            item.SubItems.Add(p.Y.ToString(CultureInfo.InvariantCulture));
-            item.SubItems.Add(btn);
-            item.SubItems.Add(p.DoubleClick ? "Double" : "Single");
+            item.SubItems.Add(p.Describe());
+            item.SubItems.Add(p.DescribeTarget());
             item.SubItems.Add(p.DelayMs.ToString(CultureInfo.InvariantCulture));
             lvPoints.Items.Add(item);
         }
         lvPoints.EndUpdate();
     }
 
-    // ---- Edit a point ----
+    // ---- Edit an action ----
     private void EditSelectedPoint()
     {
         int i = SelectedIndex();
-        if (i < 0) { lblStatus.Text = "Select a point first, then Edit."; return; }
-        var p = points[i];
+        if (i < 0) { lblStatus.Text = "Select an action first, then Edit."; return; }
 
-        using var dlg = new Form
-        {
-            Text = $"Edit point #{i + 1}",
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            ClientSize = new Size(330, 240),
-            MaximizeBox = false,
-            MinimizeBox = false
-        };
-        Label L(string t, int y) => new() { Text = t, Location = new Point(16, y + 3), AutoSize = true };
-        const int ix = 160, iw = 150;
-        var nX = new NumericUpDown { Location = new Point(ix, 16), Width = iw, Minimum = -100000, Maximum = 100000, Value = p.X };
-        var nY = new NumericUpDown { Location = new Point(ix, 50), Width = iw, Minimum = -100000, Maximum = 100000, Value = p.Y };
-        var cB = new ComboBox { Location = new Point(ix, 84), Width = iw, DropDownStyle = ComboBoxStyle.DropDownList };
-        cB.Items.AddRange(new object[] { "Left", "Right", "Middle" }); cB.SelectedIndex = Math.Clamp(p.Button, 0, 2);
-        var cT = new ComboBox { Location = new Point(ix, 118), Width = iw, DropDownStyle = ComboBoxStyle.DropDownList };
-        cT.Items.AddRange(new object[] { "Single", "Double" }); cT.SelectedIndex = p.DoubleClick ? 1 : 0;
-        var nD = new NumericUpDown { Location = new Point(ix, 152), Width = iw, Minimum = 0, Maximum = int.MaxValue, Value = p.DelayMs };
-        var ok = new Button { Text = "OK", Location = new Point(150, 196), Size = new Size(75, 32), DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Cancel", Location = new Point(233, 196), Size = new Size(82, 32), DialogResult = DialogResult.Cancel };
-        dlg.Controls.AddRange(new Control[]
-        {
-            L("X:", 16), nX, L("Y:", 50), nY, L("Button:", 84), cB,
-            L("Type:", 118), cT, L("Wait after (ms):", 152), nD, ok, cancel
-        });
-        dlg.AcceptButton = ok; dlg.CancelButton = cancel;
+        using var dlg = new ActionEditorForm(points[i], $"Edit action #{i + 1}");
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
-        if (dlg.ShowDialog(this) == DialogResult.OK)
-        {
-            p.X = (int)nX.Value; p.Y = (int)nY.Value;
-            p.Button = cB.SelectedIndex; p.DoubleClick = cT.SelectedIndex == 1;
-            p.DelayMs = (int)nD.Value;
-            RefreshList();
-            lvPoints.Items[i].Selected = true;
-        }
+        points[i] = dlg.Result;
+        RefreshList();
+        lvPoints.Items[i].Selected = true;
     }
 
     // ---- Save / Load sequence (JSON) ----
@@ -541,9 +466,12 @@ public partial class Form1 : Form
         try
         {
             File.WriteAllText(sfd.FileName, JsonSerializer.Serialize(points, JsonOpts));
-            lblStatus.Text = $"Saved {points.Count} points to {Path.GetFileName(sfd.FileName)}";
+            lblStatus.Text = $"Saved {points.Count} actions to {Path.GetFileName(sfd.FileName)}";
         }
-        catch (Exception ex) { lblStatus.Text = "Save failed: " + ex.Message; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            lblStatus.Text = "Save failed: " + ex.Message;
+        }
     }
 
     private void LoadSequence()
@@ -552,19 +480,18 @@ public partial class Form1 : Form
         if (ofd.ShowDialog(this) != DialogResult.OK) return;
         try
         {
-            var loaded = JsonSerializer.Deserialize<List<SeqPoint>>(File.ReadAllText(ofd.FileName));
+            var loaded = JsonSerializer.Deserialize<List<SeqAction>>(File.ReadAllText(ofd.FileName));
             if (loaded == null) { lblStatus.Text = "Load failed: empty file."; return; }
-            foreach (var p in loaded)
-            {
-                p.Button = Math.Clamp(p.Button, 0, 2);
-                p.DelayMs = Math.Max(0, p.DelayMs);
-            }
+            foreach (var a in loaded) a.Normalize();
             points = loaded;
             RefreshList();
             chkSequence.Checked = points.Count > 0;
-            lblStatus.Text = $"Loaded {points.Count} points from {Path.GetFileName(ofd.FileName)}";
+            lblStatus.Text = $"Loaded {points.Count} actions from {Path.GetFileName(ofd.FileName)}";
         }
-        catch (Exception ex) { lblStatus.Text = "Load failed: " + ex.Message; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            lblStatus.Text = "Load failed: " + ex.Message;
+        }
     }
 
     // ---- Recording via low-level mouse hook ----
@@ -592,7 +519,7 @@ public partial class Form1 : Form
         if (mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
         hookProc = null;
         btnRecord.Text = "● Record clicks";
-        lblStatus.Text = $"Recording finished. {points.Count} points total.";
+        lblStatus.Text = $"Recording finished. {points.Count} actions total.";
     }
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -683,8 +610,8 @@ public partial class Form1 : Form
             hotkeyName = name;
             btnStart.Text = $"Start ({hotkeyName})";
             btnStop.Text = $"Stop ({hotkeyName})";
-            RegisterHotkeys();
             lblStatus.Text = $"Ready. Press {hotkeyName} to start/stop.";
+            RegisterHotkeys();
         }
     }
 
@@ -695,7 +622,7 @@ public partial class Form1 : Form
         bool okToggle = RegisterHotKey(Handle, HOTKEY_TOGGLE, 0, hotkeyVk);
         bool okRecEnd = hotkeyVk == VK_F8 || RegisterHotKey(Handle, HOTKEY_RECEND, 0, VK_F8);
 
-        if (lblStatus is null) return; // handle can be created before BuildUi finishes
+        if (lblStatus is null) return; // the handle can be created before BuildUi finishes
         if (!okToggle)
             lblStatus.Text = $"{hotkeyName} is already claimed by another app — global hotkey OFF.\r\nUse the Start/Stop buttons, or pick a different key.";
         else if (!okRecEnd)
@@ -758,70 +685,6 @@ public partial class Form1 : Form
         return (int)Math.Min(ms, int.MaxValue);
     }
 
-    private static (uint down, uint up) ButtonFlags(int index) => index switch
-    {
-        1 => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-        2 => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-        _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-    };
-
-    private static bool SendMouse(uint flags)
-    {
-        var inp = new INPUT[1];
-        inp[0].type = INPUT_MOUSE;
-        inp[0].mi.dwFlags = flags;
-        return SendInput(1, inp, Marshal.SizeOf<INPUT>()) != 0;
-    }
-
-    private static void SendMouseChecked(uint flags)
-    {
-        if (!SendMouse(flags))
-            throw new Win32Exception(Marshal.GetLastWin32Error(),
-                "SendInput was blocked. The target window is probably running elevated — restart Auto Clicker as administrator.");
-    }
-
-    private static void DoClick(int button, bool dbl)
-    {
-        var (down, up) = ButtonFlags(button);
-        SendMouseChecked(down);
-        SendMouse(up);
-        if (dbl) { Thread.Sleep(15); SendMouse(down); SendMouse(up); }
-    }
-
-    // MAKELPARAM. Masking both halves to 16 bits matters on x64: packing a negative
-    // coordinate the naive way sign-extends and fills the whole upper dword with 1s.
-    private static IntPtr MakeLParam(int x, int y)
-    {
-        long packed = ((long)(y & 0xFFFF) << 16) | (uint)(x & 0xFFFF);
-#pragma warning disable CA2020 // deliberate wrap-around: MAKELPARAM is a 32-bit bit-packing
-        return unchecked((IntPtr)packed);
-#pragma warning restore CA2020
-    }
-
-    // Background click: post messages to the window under the point, no cursor move.
-    private static void DoBackgroundClick(int x, int y, int button, bool dbl)
-    {
-        var sp = new POINT { X = x, Y = y };
-        IntPtr hwnd = WindowFromPoint(sp);
-        if (hwnd == IntPtr.Zero) return;
-        var cp = sp;
-        if (!ScreenToClient(hwnd, ref cp)) return;
-        IntPtr lParam = MakeLParam(cp.X, cp.Y);
-        (uint down, uint up, uint dbclk, int mk) = button switch
-        {
-            1 => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON),
-            2 => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON),
-            _ => (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON),
-        };
-        PostMessage(hwnd, down, (IntPtr)mk, lParam);
-        PostMessage(hwnd, up, IntPtr.Zero, lParam);
-        if (dbl)
-        {
-            PostMessage(hwnd, dbclk, (IntPtr)mk, lParam);
-            PostMessage(hwnd, up, IntPtr.Zero, lParam);
-        }
-    }
-
     // Waits `ms`, but bails out early once `running` goes false.
     // Measured against a Stopwatch rather than by accumulating fixed steps: the old
     // "sleep 25 ms until you've slept enough" loop overshot every interval that wasn't
@@ -840,6 +703,16 @@ public partial class Form1 : Form
         }
     }
 
+    // ---- Humanize ----
+    private static int JitterMs(int ms, int percent)
+    {
+        if (ms <= 0 || percent <= 0) return ms;
+        double factor = 1 + ((Random.Shared.NextDouble() * 2) - 1) * percent / 100.0;
+        return (int)Math.Max(0, Math.Round(ms * factor));
+    }
+
+    private static int JitterPx(int maxPx) => maxPx <= 0 ? 0 : Random.Shared.Next(-maxPx, maxPx + 1);
+
     private void StartClicking()
     {
         if (recording) return;
@@ -853,6 +726,8 @@ public partial class Form1 : Form
         bool seq = chkSequence.Checked && points.Count > 0;
         bool limited = rbRepeatN.Checked;
         int limit = (int)numRepeat.Value;
+        int jitterPx = (int)numJitterPx.Value;
+        int jitterPct = (int)numJitterPct.Value;
 
         running = true;
         btnStart.Enabled = false;
@@ -861,9 +736,9 @@ public partial class Form1 : Form
         if (seq)
         {
             bool bg = chkBackground.Checked;
-            var pts = points.Select(p => new SeqPoint { X = p.X, Y = p.Y, Button = p.Button, DoubleClick = p.DoubleClick, DelayMs = p.DelayMs }).ToList();
-            lblStatus.Text = $"Running sequence of {pts.Count} points{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
-            worker = new Thread(() => RunSequence(pts, bg, limited, limit)) { IsBackground = true };
+            var acts = points.Select(p => p.Clone()).ToList();
+            lblStatus.Text = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
+            worker = new Thread(() => RunSequence(acts, bg, limited, limit, jitterPx, jitterPct)) { IsBackground = true };
         }
         else
         {
@@ -875,7 +750,7 @@ public partial class Form1 : Form
             int button = cmbButton.SelectedIndex;
             lblStatus.Text = hold ? $"Holding {cmbButton.Text} button... press {hotkeyName} to stop."
                                   : $"Clicking... press {hotkeyName} to stop.";
-            worker = new Thread(() => RunSingle(hold, dbl, button, useFixedPos, px, py, interval, limited && !hold, limit)) { IsBackground = true };
+            worker = new Thread(() => RunSingle(hold, dbl, button, useFixedPos, px, py, interval, limited && !hold, limit, jitterPx, jitterPct)) { IsBackground = true };
         }
 
         try
@@ -891,31 +766,26 @@ public partial class Form1 : Form
         }
     }
 
-    private void RunSingle(bool hold, bool dbl, int button, bool useFixedPos, int px, int py, int interval, bool limited, int limit)
+    private void RunSingle(bool hold, bool dbl, int button, bool useFixedPos, int px, int py, int interval, bool limited, int limit, int jitterPx, int jitterPct)
     {
         using var timerRes = new TimerResolutionScope();
         try
         {
             if (useFixedPos) SetCursorPos(px, py);
-            var (down, up) = ButtonFlags(button);
             if (hold)
             {
-                SendMouseChecked(down);
-                // The release MUST happen on every exit path, including an exception or a
-                // close mid-hold — otherwise the button stays physically down system-wide.
-                try { while (running) Thread.Sleep(20); }
-                finally { SendMouse(up); }
+                InputSender.HoldUntil(button, KeepGoing);
             }
             else
             {
                 int count = 0;
                 while (running)
                 {
-                    if (useFixedPos) SetCursorPos(px, py);
-                    DoClick(button, dbl);
+                    if (useFixedPos) SetCursorPos(px + JitterPx(jitterPx), py + JitterPx(jitterPx));
+                    InputSender.Click(button, dbl);
                     count++;
                     if (limited && count >= limit) break;
-                    InterruptibleSleep(interval);
+                    InterruptibleSleep(JitterMs(interval, jitterPct));
                 }
             }
         }
@@ -923,28 +793,24 @@ public partial class Form1 : Form
         finally { Finish(); }
     }
 
-    private void RunSequence(List<SeqPoint> pts, bool background, bool limited, int limit)
+    private void RunSequence(List<SeqAction> acts, bool background, bool limited, int limit, int jitterPx, int jitterPct)
     {
         using var timerRes = new TimerResolutionScope();
         try
         {
             int pass = 0;
+            // Keyboard actions have no coordinates of their own; in background mode they
+            // are posted to the window of the most recent positioned action.
+            POINT lastTarget = CursorPos();
+
             while (running)
             {
-                for (int i = 0; i < pts.Count && running; i++)
+                for (int i = 0; i < acts.Count && running; i++)
                 {
-                    var p = pts[i];
+                    var a = acts[i];
                     Highlight(i);
-                    if (background)
-                    {
-                        DoBackgroundClick(p.X, p.Y, p.Button, p.DoubleClick);
-                    }
-                    else
-                    {
-                        SetCursorPos(p.X, p.Y);
-                        DoClick(p.Button, p.DoubleClick);
-                    }
-                    InterruptibleSleep(p.DelayMs);
+                    Execute(a, background, jitterPx, ref lastTarget);
+                    InterruptibleSleep(JitterMs(a.DelayMs, jitterPct));
                 }
                 pass++;
                 if (limited && pass >= limit) break;
@@ -954,14 +820,66 @@ public partial class Form1 : Form
         finally { Highlight(-1); Finish(); }
     }
 
-    // Surfaces worker-thread failures instead of swallowing them.
-    private void ReportError(Exception ex)
+    private void Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
     {
-        if (!IsHandleCreated) return;
-        try { BeginInvoke(() => lblStatus.Text = "Stopped — " + ex.Message); }
-        catch (ObjectDisposedException) { /* form closed while we were unwinding */ }
-        catch (InvalidOperationException) { /* handle destroyed between the check and the post */ }
+        bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
+        int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
+
+        if (positioned && a.WindowRelative)
+        {
+            if (!WindowAnchor.Resolve(a, a.X, a.Y, out POINT sp))
+                throw new InvalidOperationException($"Anchor window \"{a.WindowLabel}\" is not open.");
+            x = sp.X;
+            y = sp.Y;
+            if (a.Kind == ActionKind.Drag && WindowAnchor.Resolve(a, a.EndX, a.EndY, out POINT ep))
+            {
+                ex = ep.X;
+                ey = ep.Y;
+            }
+        }
+
+        if (positioned && jitterPx > 0)
+        {
+            x += JitterPx(jitterPx);
+            y += JitterPx(jitterPx);
+            if (a.Kind == ActionKind.Drag) { ex += JitterPx(jitterPx); ey += JitterPx(jitterPx); }
+        }
+
+        if (positioned) lastTarget = new POINT { X = x, Y = y };
+
+        switch (a.Kind)
+        {
+            case ActionKind.Click:
+                if (background) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs);
+                else { SetCursorPos(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs); }
+                break;
+
+            case ActionKind.Drag:
+                if (background) InputSender.BackgroundDrag(x, y, ex, ey, a.Button, a.DragMs, KeepGoing);
+                else InputSender.Drag(x, y, ex, ey, a.Button, a.DragMs, KeepGoing);
+                break;
+
+            case ActionKind.Scroll:
+                if (background) InputSender.BackgroundScroll(x, y, a.ScrollNotches, a.Horizontal);
+                else { SetCursorPos(x, y); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
+                break;
+
+            case ActionKind.Key:
+                if (background) InputSender.BackgroundCombo(lastTarget.X, lastTarget.Y, a.KeyCombo);
+                else InputSender.SendCombo(a.KeyCombo);
+                break;
+
+            case ActionKind.Text:
+                if (background) InputSender.BackgroundTypeText(lastTarget.X, lastTarget.Y, a.Text, KeepGoing);
+                else InputSender.TypeText(a.Text, KeepGoing);
+                break;
+
+            case ActionKind.Wait:
+                break; // the DelayMs after the action is the whole point
+        }
     }
+
+    private bool KeepGoing() => running;
 
     private void Highlight(int index)
     {
@@ -980,6 +898,15 @@ public partial class Form1 : Form
         }
         catch (ObjectDisposedException) { }
         catch (InvalidOperationException) { }
+    }
+
+    // Surfaces worker-thread failures instead of swallowing them.
+    private void ReportError(Exception ex)
+    {
+        if (!IsHandleCreated) return;
+        try { BeginInvoke(() => lblStatus.Text = "Stopped — " + ex.Message); }
+        catch (ObjectDisposedException) { /* form closed while we were unwinding */ }
+        catch (InvalidOperationException) { /* handle destroyed between the check and the post */ }
     }
 
     private void Finish()

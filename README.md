@@ -8,17 +8,38 @@ fixed point, or run a recorded **sequence of points** with per-point waits.
 ## Features
 
 - **Click / Double-click / Hold** with any mouse button (left / right / middle)
-- Adjustable interval (hours / mins / secs / ms)
+- Adjustable interval (hours / mins / secs / ms), accurate to ~1 ms
 - Repeat **N times** or **until stopped**
-- **Single point** (current cursor or a picked X/Y) **or multi-point sequences**
+- **Single point** (current cursor or a picked X/Y) **or multi-action sequences**
+- Sequences aren't clicks-only — each step can be a **click, drag, scroll,
+  key combo, typed text or plain wait**
 - **Record by clicking** — hit *Record*, click each target, right-click or **F8** to finish
-- Per-point **edit** (X / Y / button / type / wait) and reorder
-- **Save / load** sequences as `.acseq` (JSON) for reuse
-- **Background mode** (experimental) — posts clicks to the window under each point
+- Per-step **edit** and reorder
+- **Window anchoring** — anchor a point to the window it was recorded in and it's
+  stored as client coordinates, so the sequence survives that window being moved,
+  resized or reopened
+- **Humanize** — randomise position by ±N px and timing by ±N %, so the input
+  isn't metronomically identical
+- **Save / load** sequences as `.acseq` (JSON) for reuse. Files written by earlier
+  versions still load.
+- **Background mode** (experimental) — posts input to the window under each point
   without moving your real cursor, so you can keep working on another monitor
   *(target-dependent — see notes below)*
-- Global **F6** start/stop hotkey (rebindable F1–F12)
-- High-DPI aware, custom icon, single self-contained build
+- Global **F6** start/stop hotkey (rebindable F1–F12); tells you if the key is
+  already claimed by another app
+- High-DPI aware, negative (multi-monitor) coordinates supported, custom icon,
+  single self-contained build
+
+## Action types
+
+| Action | What it does |
+|---|---|
+| **Click** | Press a button at a point. Single or double, with an optional hold time. |
+| **Drag** | Press at one point, travel to another over a set duration, release. |
+| **Scroll** | Wheel notches at a point, vertical or horizontal. |
+| **Key press** | A combo such as `Ctrl+C`, `Alt+Tab`, `Shift+F5`, `Enter`, `Esc`. |
+| **Type text** | Literal text, sent as Unicode — the keyboard layout doesn't matter. |
+| **Wait** | Nothing but the delay. Useful for letting a target catch up. |
 
 ## Install
 
@@ -34,8 +55,8 @@ Add-AppxPackage -Path AutoClicker.msix
 
 ## Background mode — what works
 
-Background clicking uses `PostMessage(WM_*BUTTONDOWN/UP)` to the window under each
-point. It works for many classic Win32 apps but **fails** on:
+Background mode uses `PostMessage` to the window under each point. It works for many
+classic Win32 apps but **fails** on:
 
 - Games using DirectInput / raw input (`WM_INPUT`)
 - Chrome / Electron (events flagged `isTrusted: false`)
@@ -43,6 +64,10 @@ point. It works for many classic Win32 apps but **fails** on:
 - Admin-elevated targets (blocked by UIPI)
 
 For those, use normal (foreground) mode, which moves the cursor.
+
+Keyboard actions in background mode are posted to the window of the most recent
+positioned action in the sequence, and are the least reliable part of it —
+synthesised `WM_KEY*` messages are ignored by most modern frameworks.
 
 ## Build
 
