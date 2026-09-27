@@ -28,9 +28,17 @@
          beneath them, so it must be excluded from THIS project's compile set. -->
     <Compile Remove="AutoClicker.Tests\**" />
     <None Remove="AutoClicker.Tests\**" />
-    <!-- The engine (SequenceRunner, InputSender, ProfileStore, SequenceFile...) is internal
-         by design: only the UI and CLI are "public". Tests exercise that engine directly. -->
-    <InternalsVisibleTo Include="AutoClicker.Tests" />
+    <!-- Same reason: AutoClicker.Core lives in a subfolder but is its own project. Without
+         this the exe would compile the engine sources a second time (duplicate types). -->
+    <Compile Remove="AutoClicker.Core\**" />
+    <None Remove="AutoClicker.Core\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The UI-free engine (sequence model, runner, input/vision backends, stores, CLI,
+         MCP plumbing). Its types stay internal and are visible to this exe via the
+         InternalsVisibleTo that now lives in AutoClicker.Core.csproj. -->
+    <ProjectReference Include="AutoClicker.Core\AutoClicker.Core.csproj" />
   </ItemGroup>
 
 </Project>

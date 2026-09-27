@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- UI-free engine extracted from the WinForms app (task M0): sequence model, runner,
+         input/vision backends, profile + settings stores, CLI runner, MCP host plumbing.
+         The view layer (AutoClicker.exe) and the tests are the only consumers.
+         Keep this property set identical to AutoClicker.csproj so the engine compiles under
+         the same analyzers; net10.0-windows10.0.17763.0 also unlocks the WinRT projections
+         (Windows.Media.Ocr, Windows.Graphics.Imaging, Windows.Storage.Streams) used by the
+         OCR backend. UseWindowsForms is required for the Keys enum (InputSender) and the
+         WinForms Timer types (RunController, watchers) even though no Control/Form lives here. -->
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The engine types are internal by design: only the UI and CLI are "public".
+         The WinForms exe and the test project both consume them directly. -->
+    <InternalsVisibleTo Include="AutoClicker" />
+    <InternalsVisibleTo Include="AutoClicker.Tests" />
+  </ItemGroup>
+
+</Project>
