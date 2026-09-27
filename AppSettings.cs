@@ -36,6 +36,14 @@ public sealed class AppSettings
 
     /// <summary>Virtual-key code of the start/stop hotkey. F6 by default.</summary>
     public uint HotkeyVk { get; set; } = DefaultHotkeyVk;
+
+    /// <summary>
+    /// Modifier bitmask for the start/stop hotkey (see <see cref="HotkeyManager.ModAlt"/> etc.).
+    /// 0 means an unmodified key. Letters/digits require at least one modifier; function keys
+    /// work with or without.
+    /// </summary>
+    public uint HotkeyModifiers { get; set; }
+
     public string HotkeyName { get; set; } = DefaultHotkeyName;
 
     public int StartDelaySeconds { get; set; }
@@ -50,6 +58,12 @@ public sealed class AppSettings
 
     /// <summary>Stop the run after this many seconds. 0 = unlimited.</summary>
     public int MaxRunSeconds { get; set; }
+
+    /// <summary>Stop the run after this many performed actions (across all passes). 0 = unlimited.</summary>
+    public int MaxActions { get; set; }
+
+    /// <summary>Stop the run when the user moves the mouse (opt-in; the corner fail-safe is the primary escape).</summary>
+    public bool StopOnUserMouseMove { get; set; }
 
     /// <summary>
     /// Playback speed as a percentage of recorded timing: 100 = as recorded, 200 = twice as
@@ -152,6 +166,7 @@ public sealed class AppSettings
         JitterPercent = Math.Clamp(JitterPercent, 0, 100);
         StartDelaySeconds = Math.Clamp(StartDelaySeconds, 0, 300);
         MaxRunSeconds = Math.Max(0, MaxRunSeconds);
+        MaxActions = Math.Max(0, MaxActions);
         SpeedPercent = Math.Clamp(SpeedPercent, 25, 400);
         ColorMode = Math.Clamp(ColorMode, 0, 2);
         PickedX = Math.Clamp(PickedX, -100_000, 100_000);
@@ -162,14 +177,24 @@ public sealed class AppSettings
         LastSequencePath ??= "";
         ActiveProfileName ??= "";
 
-        if (HotkeyVk < MinFunctionKeyVk || HotkeyVk > MaxFunctionKeyVk)
+        // Hotkey modifiers: only the four Win32 MOD_* bits mean anything; anything else in a
+        // hand-edited file is discarded.
+        HotkeyModifiers &= HotkeyManager.ModMask;
+
+        // Hotkey rule: function keys are valid alone or with modifiers; letters/digits are
+        // valid ONLY with at least one modifier (a bare letter would steal typing globally).
+        // Anything else collapses to F6 with no modifiers.
+        bool isFunctionKey = HotkeyVk >= MinFunctionKeyVk && HotkeyVk <= MaxFunctionKeyVk;
+        bool isLetterOrDigit = (HotkeyVk >= 0x30 && HotkeyVk <= 0x39) || (HotkeyVk >= 0x41 && HotkeyVk <= 0x5A);
+        if (!isFunctionKey && !(HotkeyModifiers != 0 && isLetterOrDigit))
         {
             HotkeyVk = DefaultHotkeyVk;
+            HotkeyModifiers = 0;
             HotkeyName = DefaultHotkeyName;
         }
         else
         {
-            string expected = FunctionKeyName(HotkeyVk);
+            string expected = HotkeyManager.FormatHotkey(HotkeyVk, HotkeyModifiers);
             if (HotkeyName != expected) HotkeyName = expected;
         }
 

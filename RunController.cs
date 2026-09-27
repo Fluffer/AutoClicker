@@ -31,6 +31,13 @@ public sealed record RunSpec
     public bool CornerFailSafe { get; init; }
     /// <summary>Stop the run after this many seconds; 0 = unlimited.</summary>
     public int MaxRunSeconds { get; init; }
+
+    /// <summary>Stop the run after this many performed actions (across all passes); 0 = unlimited.</summary>
+    public int MaxActions { get; init; }
+
+    /// <summary>Stop the run when the user moves the mouse (opt-in safety stop).</summary>
+    public bool StopOnUserMouseMove { get; init; }
+
     /// <summary>Write a per-step JSONL audit trail for this run.</summary>
     public bool RunLoggingEnabled { get; init; }
 
@@ -63,6 +70,7 @@ public sealed record RunSpec
 internal sealed class RunController : IDisposable
 {
     private const string PanicMessage = "Panic stop — all buttons released.";
+    private const string MouseMoveStopMessage = "Stopped: mouse moved (stop-on-move).";
 
     private readonly SequenceRunner runner;
     private readonly Func<bool> armPanic;
@@ -80,6 +88,21 @@ internal sealed class RunController : IDisposable
     private readonly System.Diagnostics.Stopwatch runStopwatch = new();
     private int watchdogSeconds; // 0 = unlimited
     private bool watchdogTriggered;
+    // Max-actions watchdog, mirroring MaxRunSeconds: counted here from the runner's
+    // per-step callbacks, checked in KeepGoing so the stop lands on the same hot path.
+    private int maxActions; // 0 = unlimited
+    private int performedActions;
+    private bool actionsWatchdogTriggered;
+    // Stop-on-mouse-move: armed only while a run is actually executing (never during the
+    // start-delay countdown, when the user is expected to be repositioning the cursor).
+    //
+    // NOTE (deferred): BlockInputDuringRun was considered and deliberately NOT shipped. Win32
+    // BlockInput() blocks the raw input queue for the whole session, and for a non-elevated
+    // process there is no escape hatch — the panic hotkey (a RegisterHotKey) would not fire
+    // while input is blocked, so a long run would lock the user out with no way to stop it.
+    // Input blocking arrives with true pause/resume in the step debugger (Wave 2).
+    private MouseMoveWatcher? mouseMoveWatcher;
+    private bool stopOnMouseMove;
     // Status the run should end on, set by the failure/watchdog paths and consumed by
     // OnStopped so the worker's own "Stopped. Press ..." line doesn't overwrite it.
     private string? stopStatus;
@@ -137,6 +160,11 @@ internal sealed class RunController : IDisposable
         stopStatus = null;
         watchdogTriggered = false;
         watchdogSeconds = spec.MaxRunSeconds;
+        actionsWatchdogTriggered = false;
+        maxActions = spec.MaxActions;
+        performedActions = 0;
+        stopOnMouseMove = spec.StopOnUserMouseMove;
+        mouseMoveWatcher = null;
         runLoggingEnabled = spec.RunLoggingEnabled;
         failSafeStopped = false;
         restoreCursor = spec.RestoreCursorAfterRun;
@@ -261,6 +289,8 @@ internal sealed class RunController : IDisposable
     {
         startDelayTimer?.Dispose();
         startDelayTimer = null;
+        mouseMoveWatcher?.Stop();
+        mouseMoveWatcher = null;
     }
 
     private void StartWorkerThread()
@@ -268,6 +298,26 @@ internal sealed class RunController : IDisposable
         // The watchdog counts from when the worker actually starts — not from when Start
         // was pressed — so a long start-delay countdown never eats into MaxRunSeconds.
         runStopwatch.Restart();
+
+        // Stop-on-mouse-move is armed here, not in TryStart, so moving the mouse during
+        // the start-delay countdown (to position it) never cancels the run. Installed on
+        // the UI thread — the same thread this method runs on — which is where the hook
+        // callback will be delivered.
+        if (stopOnMouseMove)
+        {
+            var watcher = new MouseMoveWatcher();
+            watcher.Moved += OnUserMouseMoved;
+            if (!watcher.Start())
+            {
+                watcher.Moved -= OnUserMouseMoved;
+                StatusChanged?.Invoke("Stop-on-mouse-move unavailable (mouse hook busy) — running without it.");
+            }
+            else
+            {
+                mouseMoveWatcher = watcher;
+            }
+        }
+
         try
         {
             worker!.Start();
@@ -337,6 +387,7 @@ internal sealed class RunController : IDisposable
     // means the run ended and any highlight should be cleared.
     private void OnRunnerStep(int index, bool performed)
     {
+        if (index >= 0 && performed) performedActions++;
         LogStep(index, performed);
         StepCompleted?.Invoke(index, performed);
     }
@@ -367,7 +418,26 @@ internal sealed class RunController : IDisposable
             watchdogTriggered = true;
             return false;
         }
+        // The max-actions watchdog uses the same mechanism, counting performed actions.
+        if (running && MaxActionsReached(performedActions, maxActions))
+        {
+            actionsWatchdogTriggered = true;
+            return false;
+        }
         return running;
+    }
+
+    /// <summary>True when a positive performed-action budget has been reached. Pure, for tests.</summary>
+    internal static bool MaxActionsReached(int performed, int maxActions) =>
+        maxActions > 0 && performed >= maxActions;
+
+    // The stop-on-mouse-move watcher fires on the UI thread (the thread that installed the
+    // hook); setting stopStatus here means OnStopped reports it, and Stop() is idempotent
+    // so a duplicate fire between Stop and OnStopped is harmless.
+    private void OnUserMouseMoved()
+    {
+        stopStatus = MouseMoveStopMessage;
+        Stop();
     }
 
     private void Finish()
@@ -396,6 +466,8 @@ internal sealed class RunController : IDisposable
     private void OnStopped()
     {
         disarmPanic();
+        mouseMoveWatcher?.Stop();
+        mouseMoveWatcher = null;
         RunningChanged?.Invoke(false);
         // Confirming the buttons were force-released is the whole point of the panic key,
         // so don't let the worker's own async "Stopped" message land on top of that. A
@@ -403,6 +475,7 @@ internal sealed class RunController : IDisposable
         // instead of the generic "Stopped. Press ..." line.
         string status = panicStopped ? PanicMessage
             : watchdogTriggered ? "Watchdog: max run time reached."
+            : actionsWatchdogTriggered ? "Watchdog: max actions reached."
             : stopStatus ?? $"Stopped. Press {hotkeyNameProvider()} to start.";
         StatusChanged?.Invoke(status);
     }

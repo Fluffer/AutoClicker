@@ -70,7 +70,7 @@ public class ProfileControllerTests : IDisposable
         var controller = new ProfileController();
         controller.Load(new AppSettings { ActiveProfileName = "Farm" });
 
-        var result = controller.SetHotkey(0, 0x75, 0x75); // F6 == the main hotkey F6
+        var result = controller.SetHotkey(0, 0x75, 0x75, 0); // F6 == the main hotkey F6
 
         Assert.False(result.RegisterHotkeys);
         Assert.Equal("F6 is already the start/stop hotkey — pick a different key.", result.Status);

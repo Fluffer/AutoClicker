@@ -95,6 +95,12 @@ internal sealed class RecordingController
     {
         recording = false;
         clock.Stop();
+        // Flush any coalesced typed text still pending, so a word typed right before F8 /
+        // right-click becomes its Text action instead of being lost. Stop runs on the UI
+        // thread (button, F8 hotkey and right-click all originate there), so reporting here
+        // is synchronous and on the same thread as every other ActionRecorded delivery.
+        if (assembler is not null && assembler.Flush() is { } e)
+            ActionRecorded?.Invoke(e, false);
         Cleanup();
     }
 
@@ -157,8 +163,11 @@ internal sealed class RecordingController
         uiMarshal(() =>
         {
             if (!recording) return;
-            if (assembler!.MouseUp(button, data.pt.X, data.pt.Y, ts) is { } e)
-                ActionRecorded?.Invoke(e.Action, e.ReplacesLast);
+            var e = assembler!.MouseUp(button, data.pt.X, data.pt.Y, ts);
+            foreach (RecordingEmission f in assembler.TakeFlushedEmissions())
+                ActionRecorded?.Invoke(f.Action, f.ReplacesLast);
+            if (e is { } em)
+                ActionRecorded?.Invoke(em.Action, em.ReplacesLast);
         });
         return CallNextHookEx(mouseHook, nCode, wParam, lParam);
     }
@@ -172,8 +181,11 @@ internal sealed class RecordingController
         uiMarshal(() =>
         {
             if (!recording) return;
-            if (assembler!.MouseWheel(delta, horizontal, data.pt.X, data.pt.Y, ts) is { } e)
-                ActionRecorded?.Invoke(e.Action, e.ReplacesLast);
+            var e = assembler!.MouseWheel(delta, horizontal, data.pt.X, data.pt.Y, ts);
+            foreach (RecordingEmission f in assembler.TakeFlushedEmissions())
+                ActionRecorded?.Invoke(f.Action, f.ReplacesLast);
+            if (e is { } em)
+                ActionRecorded?.Invoke(em.Action, em.ReplacesLast);
         });
         return CallNextHookEx(mouseHook, nCode, wParam, lParam);
     }
@@ -211,8 +223,11 @@ internal sealed class RecordingController
                 uiMarshal(() =>
                 {
                     if (!recording) return;
-                    if (assembler!.KeyDown(vk, ts) is { } e)
-                        ActionRecorded?.Invoke(e.Action, e.ReplacesLast);
+                    var e = assembler!.KeyDown(vk, ts);
+                    foreach (RecordingEmission f in assembler.TakeFlushedEmissions())
+                        ActionRecorded?.Invoke(f.Action, f.ReplacesLast);
+                    if (e is { } em)
+                        ActionRecorded?.Invoke(em.Action, em.ReplacesLast);
                 });
             }
             return CallNextHookEx(keyboardHook, nCode, wParam, lParam); // recording does NOT swallow keys

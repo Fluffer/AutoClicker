@@ -155,15 +155,17 @@ public class RecordingAssemblerTests
     // ---- Keyboard: bare keys, combos, modifiers, repeats ----
 
     [Fact]
-    public void Bare_key_emits_its_own_name()
+    public void Bare_letter_coalesces_into_a_text_action()
     {
         var asm = new RecordingAssembler();
         RecordingEmission? e = asm.KeyDown((int)Keys.A, 100);
         asm.KeyUp((int)Keys.A);
 
-        Assert.NotNull(e);
-        Assert.Equal(ActionKind.Key, e.Value.Action.Kind);
-        Assert.Equal("A", e.Value.Action.KeyCombo);
+        Assert.Null(e); // absorbed into the pending text buffer, not emitted yet
+        SeqAction? flushed = asm.Flush();
+        Assert.NotNull(flushed);
+        Assert.Equal(ActionKind.Text, flushed.Kind);
+        Assert.Equal("a", flushed.Text);
         Assert.Single(asm.Actions);
     }
 
@@ -224,12 +226,14 @@ public class RecordingAssemblerTests
     [Fact]
     public void Held_key_repeat_is_suppressed()
     {
+        // F5 is non-printable, so it stays a Key action — keeping this test focused on
+        // repeat suppression rather than the coalescing path.
         var asm = new RecordingAssembler();
-        asm.KeyDown((int)Keys.A, 100);
-        Assert.Null(asm.KeyDown((int)Keys.A, 120)); // auto-repeat
-        asm.KeyUp((int)Keys.A);
-        RecordingEmission? second = asm.KeyDown((int)Keys.A, 400);
-        asm.KeyUp((int)Keys.A);
+        asm.KeyDown((int)Keys.F5, 100);
+        Assert.Null(asm.KeyDown((int)Keys.F5, 120)); // auto-repeat
+        asm.KeyUp((int)Keys.F5);
+        RecordingEmission? second = asm.KeyDown((int)Keys.F5, 400);
+        asm.KeyUp((int)Keys.F5);
 
         Assert.NotNull(second);
         Assert.Equal(2, asm.Actions.Count);
@@ -288,16 +292,11 @@ public class RecordingAssemblerTests
     // ---- Round-trip: everything the recorder emits must parse back through the player ----
 
     [Theory]
-    [InlineData((int)Keys.A)]
-    [InlineData((int)Keys.Z)]
-    [InlineData((int)Keys.D0)]
-    [InlineData((int)Keys.D9)]
     [InlineData((int)Keys.F1)]
     [InlineData((int)Keys.F12)]
     [InlineData((int)Keys.Return)]
     [InlineData((int)Keys.Escape)]
     [InlineData((int)Keys.Tab)]
-    [InlineData((int)Keys.Space)]
     [InlineData((int)Keys.Left)]
     [InlineData((int)Keys.Up)]
     [InlineData((int)Keys.Right)]
@@ -320,5 +319,115 @@ public class RecordingAssemblerTests
             $"{combo}: {error}");
         Assert.Equal((ushort)vk, parsed);
         asm.KeyUp(vk);
+    }
+
+    [Theory]
+    [InlineData((int)Keys.A, "a")]
+    [InlineData((int)Keys.Z, "z")]
+    [InlineData((int)Keys.D0, "0")]
+    [InlineData((int)Keys.D9, "9")]
+    [InlineData((int)Keys.Space, " ")]
+    [InlineData((int)Keys.OemPeriod, ".")]
+    public void Printable_key_coalesces_into_the_matching_text_char(int vk, string expected)
+    {
+        var asm = new RecordingAssembler();
+        RecordingEmission? e = asm.KeyDown(vk, 0);
+        asm.KeyUp(vk);
+
+        Assert.Null(e); // coalesced, not a Key action
+        SeqAction? text = asm.Flush();
+        Assert.NotNull(text);
+        Assert.Equal(ActionKind.Text, text.Kind);
+        Assert.Equal(expected, text.Text);
+    }
+
+    // ---- Typed-text coalescing (Bartels "capture keyboard as combined text") ----
+
+    [Fact]
+    public void Typing_a_word_produces_one_text_action()
+    {
+        var asm = new RecordingAssembler();
+        long t = 100;
+        foreach (char ch in "hello")
+        {
+            asm.KeyDown(VkOf(ch), t);
+            asm.KeyUp(VkOf(ch));
+            t += 50;
+        }
+
+        Assert.Empty(asm.Actions); // still pending — nothing emitted yet
+        SeqAction? flushed = asm.Flush();
+        Assert.NotNull(flushed);
+        Assert.Equal(ActionKind.Text, flushed.Kind);
+        Assert.Equal("hello", flushed.Text);
+        Assert.Single(asm.Actions);
+        Assert.Equal(0, asm.Actions[0].DelayMs); // first action: no gap
+    }
+
+    [Fact]
+    public void Modifier_chord_flushes_pending_text_and_is_not_coalesced()
+    {
+        var asm = new RecordingAssembler();
+        asm.KeyDown((int)Keys.H, 100); asm.KeyUp((int)Keys.H);
+        asm.KeyDown((int)Keys.I, 150); asm.KeyUp((int)Keys.I);
+
+        asm.KeyDown(0x11, 200); // Ctrl
+        RecordingEmission? key = asm.KeyDown((int)Keys.C, 220);
+        asm.KeyUp((int)Keys.C);
+        asm.KeyUp(0x11);
+
+        Assert.NotNull(key);
+        Assert.Equal(ActionKind.Key, key.Value.Action.Kind);
+        Assert.Equal("Ctrl+C", key.Value.Action.KeyCombo);
+
+        var extra = asm.TakeFlushedEmissions();
+        Assert.Single(extra);
+        Assert.Equal(ActionKind.Text, extra[0].Action.Kind);
+        Assert.Equal("hi", extra[0].Action.Text);
+
+        Assert.Equal(2, asm.Actions.Count);
+        Assert.Equal(ActionKind.Text, asm.Actions[0].Kind);
+        Assert.Equal(ActionKind.Key, asm.Actions[1].Kind);
+    }
+
+    [Fact]
+    public void A_long_typing_gap_splits_words_into_separate_text_actions()
+    {
+        var asm = new RecordingAssembler();
+        asm.KeyDown((int)Keys.A, 100); asm.KeyUp((int)Keys.A);
+        asm.KeyDown((int)Keys.B, 150); asm.KeyUp((int)Keys.B);
+        // Gap > 400 ms: the next character starts a new word.
+        asm.KeyDown((int)Keys.C, 1000); asm.KeyUp((int)Keys.C);
+
+        var extra = asm.TakeFlushedEmissions();
+        Assert.Single(extra);
+        Assert.Equal("ab", extra[0].Action.Text);
+        Assert.Single(asm.Actions);
+
+        SeqAction? rest = asm.Flush();
+        Assert.NotNull(rest);
+        Assert.Equal("c", rest.Text);
+        Assert.Equal(2, asm.Actions.Count);
+        Assert.Equal(850, asm.Actions[1].DelayMs); // 1000 - 150 (the pause survives replay)
+    }
+
+    [Fact]
+    public void Punctuation_coalesces_into_text()
+    {
+        var asm = new RecordingAssembler();
+        asm.KeyDown((int)Keys.A, 100); asm.KeyUp((int)Keys.A);
+        asm.KeyDown((int)Keys.OemPeriod, 150); asm.KeyUp((int)Keys.OemPeriod);
+
+        SeqAction? text = asm.Flush();
+        Assert.NotNull(text);
+        Assert.Equal(ActionKind.Text, text.Kind);
+        Assert.Equal("a.", text.Text);
+    }
+
+    private static int VkOf(char ch)
+    {
+        if (ch >= 'a' && ch <= 'z') return (int)Keys.A + (ch - 'a');
+        if (ch >= '0' && ch <= '9') return (int)Keys.D0 + (ch - '0');
+        throw new ArgumentException($"Not a letter or digit: {ch}");
     }
 }

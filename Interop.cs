@@ -142,6 +142,9 @@ internal static class Native
     /// <summary>KBDLLHOOKSTRUCT.flags bit: the event is a key-up.</summary>
     internal const uint LLKHF_UP = 0x80;
 
+    /// <summary>MSLLHOOKSTRUCT.flags bit: the mouse event was injected (SendInput / mouse_event).</summary>
+    internal const uint LLMHF_INJECTED = 0x1;
+
     // ---- Misc ----
 
     internal const uint GA_ROOT = 2;

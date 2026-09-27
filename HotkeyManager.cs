@@ -1,19 +1,31 @@
+using System.Globalization;
+using System.Text;
 using static AutoClicker.Native;
 
 namespace AutoClicker;
 
 /// <summary>
-/// Owns every global hotkey the app uses: the main start/stop toggle (F1-F12), the F8
-/// end-recording key, the Esc panic key (armed only during a run) and one hotkey per
-/// profile. Registration is separated from the form because RegisterHotKey needs a real
-/// HWND, which does not exist during the constructor — callers pass a lazy
-/// <see cref="Func{IntPtr}"/> and this class resolves it at the moment each key is
-/// claimed. Status strings are reported through <paramref name="reportStatus"/>, which
-/// the form wires to a label (null-safe, because the handle can be created before
+/// Owns every global hotkey the app uses: the main start/stop toggle (F1-F12, optionally
+/// with Ctrl/Alt/Shift/Win modifiers), the F8 end-recording key, the Esc panic key (armed
+/// only during a run) and one hotkey per profile. Registration is separated from the form
+/// because RegisterHotKey needs a real HWND, which does not exist during the constructor —
+/// callers pass a lazy <see cref="Func{IntPtr}"/> and this class resolves it at the moment
+/// each key is claimed. Status strings are reported through <paramref name="reportStatus"/>,
+/// which the form wires to a label (null-safe, because the handle can be created before
 /// BuildUi finishes and the label exists).
 /// </summary>
 internal sealed class HotkeyManager
 {
+    // Win32 RegisterHotKey fsModifiers bitmask values (MOD_*). HotkeyModifiers in settings
+    // stores this exact bitmask. Profile hotkeys and the F8/panic keys always use 0.
+    internal const uint ModAlt = 0x1;
+    internal const uint ModCtrl = 0x2;
+    internal const uint ModShift = 0x4;
+    internal const uint ModWin = 0x8;
+
+    /// <summary>All four modifier bits; the settings value is masked to this on load.</summary>
+    internal const uint ModMask = 0xF;
+
     private const int HOTKEY_TOGGLE = 0xB001;
     private const int HOTKEY_RECEND = 0xB002;
     private const int HOTKEY_PANIC = 0xB003;
@@ -68,13 +80,16 @@ internal sealed class HotkeyManager
     }
 
     /// <summary>Registers the main start/stop hotkey and the F8 end-recording hotkey.</summary>
-    public void RegisterMain(uint hotkeyVk, string hotkeyName)
+    public void RegisterMain(uint hotkeyVk, uint modifiers, string hotkeyName)
     {
         IntPtr hwnd = hwndProvider();
         UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
         UnregisterHotKey(hwnd, HOTKEY_RECEND);
-        bool okToggle = RegisterHotKey(hwnd, HOTKEY_TOGGLE, 0, hotkeyVk);
-        bool okRecEnd = hotkeyVk == VK_F8 || RegisterHotKey(hwnd, HOTKEY_RECEND, 0, VK_F8);
+        bool okToggle = RegisterHotKey(hwnd, HOTKEY_TOGGLE, modifiers, hotkeyVk);
+        // F8 ends recording. With modifiers the plain F8 stays free (Ctrl+F8 doesn't
+        // clash with F8), so the skip only applies to an unmodified F8 main hotkey.
+        bool okRecEnd = (hotkeyVk == VK_F8 && modifiers == 0)
+            || RegisterHotKey(hwnd, HOTKEY_RECEND, 0, VK_F8);
 
         if (!okToggle)
             reportStatus($"{hotkeyName} is already claimed by another app — global hotkey OFF.\r\nUse the Start/Stop buttons, or pick a different key.");
@@ -118,7 +133,7 @@ internal sealed class HotkeyManager
     // assignments can both change between calls (New/Rename/Duplicate/Delete/hotkey edit),
     // and a stale registration would otherwise keep claiming a key globally forever — the
     // same leak RegisterHotKey risks everywhere else it's used.
-    public void RegisterProfiles(IReadOnlyList<Profile> profiles, uint mainVk)
+    public void RegisterProfiles(IReadOnlyList<Profile> profiles, uint mainVk, uint mainModifiers)
     {
         UnregisterProfiles();
         if (!ProfilesEnabled) return;
@@ -132,8 +147,10 @@ internal sealed class HotkeyManager
             // A collision with the main hotkey or F8 is already rejected at assignment time
             // (ProfileController.SetHotkey), so reaching here with one is only possible via
             // a hand-edited profiles.json — skip it rather than register something that
-            // would silently steal F6/F8 from the rest of the app.
-            if (vk == mainVk || vk == VK_F8) continue;
+            // would silently steal F6/F8 from the rest of the app. Profile hotkeys are
+            // registered unmodified, so they only clash with an unmodified main hotkey;
+            // Ctrl+F6 and a profile F6 can coexist.
+            if ((mainModifiers == 0 && vk == mainVk) || vk == VK_F8) continue;
 
             int id = ProfileHotkeyIdBase + i;
             if (RegisterHotKey(hwnd, id, 0, vk))
@@ -142,6 +159,31 @@ internal sealed class HotkeyManager
                 reportStatus($"{profiles[i].HotkeyName} is already claimed by another app — \"{profiles[i].Name}\" hotkey OFF.");
         }
     }
+
+    /// <summary>
+    /// The display string for a hotkey combo, e.g. <c>Ctrl+Alt+F6</c> or <c>F6</c>. Extracted
+    /// pure so the settings Normalize and the tests share one authoritative formatting rule
+    /// (modifier order is fixed: Ctrl, Alt, Shift, Win).
+    /// </summary>
+    internal static string FormatHotkey(uint vk, uint modifiers)
+    {
+        var sb = new StringBuilder();
+        if ((modifiers & ModCtrl) != 0) sb.Append("Ctrl+");
+        if ((modifiers & ModAlt) != 0) sb.Append("Alt+");
+        if ((modifiers & ModShift) != 0) sb.Append("Shift+");
+        if ((modifiers & ModWin) != 0) sb.Append("Win+");
+        sb.Append(KeyName(vk));
+        return sb.ToString();
+    }
+
+    /// <summary>F1-F12, letters and digits by name; anything else by its numeric code.</summary>
+    private static string KeyName(uint vk) => vk switch
+    {
+        >= 0x70 and <= 0x7B => "F" + (vk - 0x70 + 1).ToString(CultureInfo.InvariantCulture),
+        >= 0x41 and <= 0x5A => ((char)vk).ToString(),
+        >= 0x30 and <= 0x39 => ((char)vk).ToString(),
+        _ => vk.ToString(CultureInfo.InvariantCulture),
+    };
 
     public void UnregisterProfiles()
     {

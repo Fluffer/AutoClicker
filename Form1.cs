@@ -26,7 +26,9 @@ public partial class Form1 : Form
     private CheckBox chkPanic = null!;
     private Button btnPanicKey = null!;
     private NumericUpDown numMaxRunSeconds = null!;
+    private NumericUpDown numMaxActions = null!;
     private CheckBox chkCornerFailSafe = null!;
+    private CheckBox chkStopOnMouseMove = null!;
     private CheckBox chkRunLogging = null!;
     private CheckBox chkMinimizeToTray = null!;
     private ComboBox cmbColorMode = null!;
@@ -60,6 +62,7 @@ public partial class Form1 : Form
     // finished status lines report only what THIS session recorded.
     private int recordStartCount;
     private uint hotkeyVk = 0x75; // F6
+    private uint hotkeyModifiers; // Win32 MOD_* bitmask (0 = unmodified)
     private string hotkeyName = "F6";
     private uint panicKeyVk = 0x1B; // Esc
     private string panicKeyName = "Esc";
@@ -87,6 +90,7 @@ public partial class Form1 : Form
         // the persisted hotkey by the time the controls are built.
         settings = AppSettings.Load();
         hotkeyVk = settings.HotkeyVk;
+        hotkeyModifiers = settings.HotkeyModifiers;
         hotkeyName = settings.HotkeyName;
         panicKeyVk = settings.PanicKeyVk;
         panicKeyName = settings.PanicKeyName;
@@ -181,7 +185,9 @@ public partial class Form1 : Form
         numStartDelay.Value = settings.StartDelaySeconds;
         chkPanic.Checked = settings.PanicKeyEnabled;
         numMaxRunSeconds.Value = Math.Clamp(settings.MaxRunSeconds, (int)numMaxRunSeconds.Minimum, (int)numMaxRunSeconds.Maximum);
+        numMaxActions.Value = Math.Clamp(settings.MaxActions, (int)numMaxActions.Minimum, (int)numMaxActions.Maximum);
         chkCornerFailSafe.Checked = settings.CornerFailSafe;
+        chkStopOnMouseMove.Checked = settings.StopOnUserMouseMove;
         chkRunLogging.Checked = settings.RunLoggingEnabled;
         chkMinimizeToTray.Checked = settings.MinimizeToTray;
         cmbColorMode.SelectedIndex = settings.ColorMode;
@@ -211,6 +217,7 @@ public partial class Form1 : Form
         settings.JitterPixels = (int)numJitterPx.Value;
         settings.JitterPercent = (int)numJitterPct.Value;
         settings.HotkeyVk = hotkeyVk;
+        settings.HotkeyModifiers = hotkeyModifiers;
         settings.HotkeyName = hotkeyName;
         settings.StartDelaySeconds = (int)numStartDelay.Value;
         settings.PanicKeyEnabled = chkPanic.Checked;
@@ -218,6 +225,8 @@ public partial class Form1 : Form
         settings.PanicKeyName = panicKeyName;
         settings.CornerFailSafe = chkCornerFailSafe.Checked;
         settings.MaxRunSeconds = (int)numMaxRunSeconds.Value;
+        settings.MaxActions = (int)numMaxActions.Value;
+        settings.StopOnUserMouseMove = chkStopOnMouseMove.Checked;
         settings.RunLoggingEnabled = chkRunLogging.Checked;
         settings.SpeedPercent = (int)numSpeed.Value;
         settings.RestoreCursorAfterRun = chkRestoreCursor.Checked;
@@ -623,27 +632,40 @@ public partial class Form1 : Form
         limitFlow.Controls.Add(Lbl("seconds (0 = unlimited)"));
         t.Controls.Add(limitFlow, 1, 1);
 
+        // Max-actions watchdog: same "stop after N" shape as MaxRunSeconds, but counting
+        // performed actions across the whole run (all passes) instead of wall-clock time.
+        t.Controls.Add(Lbl("and after"), 0, 2);
+        var maxActionsFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        numMaxActions = NewNum(0, 1_000_000, 0);
+        maxActionsFlow.Controls.Add(numMaxActions);
+        maxActionsFlow.Controls.Add(Lbl("actions (0 = unlimited)"));
+        t.Controls.Add(maxActionsFlow, 1, 2);
+
         chkPanic = new CheckBox { Text = "Panic key stops the run", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 3) };
-        t.Controls.Add(chkPanic, 0, 2);
+        t.Controls.Add(chkPanic, 0, 3);
         btnPanicKey = new Button { Text = "Panic key: " + panicKeyName, AutoSize = true, Margin = new Padding(6, 6, 3, 3) };
         btnPanicKey.Click += (_, _) => RebindPanicKey();
-        t.Controls.Add(btnPanicKey, 1, 2);
+        t.Controls.Add(btnPanicKey, 1, 3);
 
         chkCornerFailSafe = new CheckBox { Text = "Corner fail-safe (cursor in a screen corner stops the run)", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 3) };
-        t.Controls.Add(chkCornerFailSafe, 0, 3);
+        t.Controls.Add(chkCornerFailSafe, 0, 4);
         t.SetColumnSpan(chkCornerFailSafe, 2);
 
+        chkStopOnMouseMove = new CheckBox { Text = "Stop when I move the mouse", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkStopOnMouseMove, 0, 5);
+        t.SetColumnSpan(chkStopOnMouseMove, 2);
+
         chkMinimizeToTray = new CheckBox { Text = "Minimize to tray", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-        t.Controls.Add(chkMinimizeToTray, 0, 4);
+        t.Controls.Add(chkMinimizeToTray, 0, 6);
         t.SetColumnSpan(chkMinimizeToTray, 2);
 
         chkRunLogging = new CheckBox { Text = "Write a per-step run log (JSONL)", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-        t.Controls.Add(chkRunLogging, 0, 5);
+        t.Controls.Add(chkRunLogging, 0, 7);
         t.SetColumnSpan(chkRunLogging, 2);
 
         btnSchedule = new Button { Text = "Schedule…", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
         btnSchedule.Click += (_, _) => BtnSchedule_Click();
-        t.Controls.Add(btnSchedule, 0, 6);
+        t.Controls.Add(btnSchedule, 0, 8);
 
         // Colour mode is applied at process start (see Program.Main), before any window
         // exists, so changing it here can't take effect until the next launch. Being honest
@@ -651,22 +673,22 @@ public partial class Form1 : Form
         cmbColorMode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, Margin = new Padding(3, 6, 3, 3) };
         cmbColorMode.Items.AddRange("Light (classic)", "Dark", "Follow system");
         cmbColorMode.SelectedIndex = 0;
-        t.Controls.Add(Lbl("Color mode"), 0, 7);
+        t.Controls.Add(Lbl("Color mode"), 0, 9);
         var colorModeFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
         colorModeFlow.Controls.Add(cmbColorMode);
         colorModeFlow.Controls.Add(Lbl("applies on next launch"));
-        t.Controls.Add(colorModeFlow, 1, 7);
+        t.Controls.Add(colorModeFlow, 1, 9);
 
-        t.Controls.Add(Lbl("Playback speed"), 0, 8);
+        t.Controls.Add(Lbl("Playback speed"), 0, 10);
         var speedFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
         numSpeed = NewNum(25, 400, 100);
         numSpeed.Width = 70;
         speedFlow.Controls.Add(numSpeed);
         speedFlow.Controls.Add(Lbl("% of recorded timing (100 = as recorded, 200 = twice as fast)"));
-        t.Controls.Add(speedFlow, 1, 8);
+        t.Controls.Add(speedFlow, 1, 10);
 
         chkRestoreCursor = new CheckBox { Text = "Restore mouse position when the run ends", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-        t.Controls.Add(chkRestoreCursor, 0, 9);
+        t.Controls.Add(chkRestoreCursor, 0, 11);
         t.SetColumnSpan(chkRestoreCursor, 2);
 
         grp.Controls.Add(t);
@@ -1291,29 +1313,56 @@ public partial class Form1 : Form
             Text = "Hotkey setting",
             FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterParent,
-            ClientSize = new Size(300, 120),
+            ClientSize = new Size(360, 156),
             MaximizeBox = false,
             MinimizeBox = false
         };
         var lbl = new Label { Text = "Start/Stop hotkey:", Location = new Point(16, 20), AutoSize = true };
-        var cmb = new ComboBox { Location = new Point(160, 16), Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
-        for (int i = 1; i <= 12; i++) cmb.Items.Add("F" + i);
-        cmb.SelectedItem = hotkeyName;
-        if (cmb.SelectedIndex < 0) cmb.SelectedIndex = 5;
-        var ok = new Button { Text = "OK", Location = new Point(120, 68), Size = new Size(75, 32), DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Cancel", Location = new Point(203, 68), Size = new Size(82, 32), DialogResult = DialogResult.Cancel };
-        dlg.Controls.AddRange(new Control[] { lbl, cmb, ok, cancel });
+        var cmb = new ComboBox { Location = new Point(160, 16), Width = 176, DropDownStyle = ComboBoxStyle.DropDownList };
+        // F1-F12, then A-Z, then 0-9. Letters/digits need at least one modifier (enforced
+        // below), matching the Normalize rule.
+        var keys = new List<(string Name, uint Vk)>();
+        for (int i = 1; i <= 12; i++) keys.Add(($"F{i}", (uint)(0x70 + i - 1)));
+        for (char c = 'A'; c <= 'Z'; c++) keys.Add((c.ToString(), c));
+        for (char c = '0'; c <= '9'; c++) keys.Add((c.ToString(), c));
+        foreach (var k in keys) cmb.Items.Add(k.Name);
+        int currentIndex = hotkeyVk is >= 0x70 and <= 0x7B ? (int)(hotkeyVk - 0x70)
+            : hotkeyVk is >= 0x41 and <= 0x5A ? 12 + (int)(hotkeyVk - 0x41)
+            : hotkeyVk is >= 0x30 and <= 0x39 ? 12 + 26 + (int)(hotkeyVk - 0x30)
+            : 5; // F6
+        cmb.SelectedIndex = currentIndex;
+
+        var chkCtrl = new CheckBox { Text = "Ctrl", Location = new Point(16, 56), AutoSize = true, Checked = (hotkeyModifiers & HotkeyManager.ModCtrl) != 0 };
+        var chkAlt = new CheckBox { Text = "Alt", Location = new Point(76, 56), AutoSize = true, Checked = (hotkeyModifiers & HotkeyManager.ModAlt) != 0 };
+        var chkShift = new CheckBox { Text = "Shift", Location = new Point(126, 56), AutoSize = true, Checked = (hotkeyModifiers & HotkeyManager.ModShift) != 0 };
+        var chkWin = new CheckBox { Text = "Win", Location = new Point(190, 56), AutoSize = true, Checked = (hotkeyModifiers & HotkeyManager.ModWin) != 0 };
+        var ok = new Button { Text = "OK", Location = new Point(150, 104), Size = new Size(75, 32), DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Location = new Point(233, 104), Size = new Size(100, 32), DialogResult = DialogResult.Cancel };
+        dlg.Controls.AddRange(new Control[] { lbl, cmb, chkCtrl, chkAlt, chkShift, chkWin, ok, cancel });
         dlg.AcceptButton = ok; dlg.CancelButton = cancel;
-        if (dlg.ShowDialog(this) == DialogResult.OK && cmb.SelectedItem is string name)
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        uint vk = keys[cmb.SelectedIndex].Vk;
+        uint mods = 0;
+        if (chkCtrl.Checked) mods |= HotkeyManager.ModCtrl;
+        if (chkAlt.Checked) mods |= HotkeyManager.ModAlt;
+        if (chkShift.Checked) mods |= HotkeyManager.ModShift;
+        if (chkWin.Checked) mods |= HotkeyManager.ModWin;
+
+        bool isFunctionKey = vk is >= 0x70 and <= 0x7B;
+        if (mods == 0 && !isFunctionKey)
         {
-            int fn = int.Parse(name.AsSpan(1), CultureInfo.InvariantCulture);
-            hotkeyVk = (uint)(0x70 + (fn - 1));
-            hotkeyName = name;
-            btnStart.Text = $"Start ({hotkeyName})";
-            btnStop.Text = $"Stop ({hotkeyName})";
-            lblStatus.Text = $"Ready. Press {hotkeyName} to start/stop.";
-            hotkeyManager.RegisterMain(hotkeyVk, hotkeyName);
+            lblStatus.Text = "A letter or digit needs at least one modifier (Ctrl/Alt/Shift/Win) — only F1-F12 work alone.";
+            return;
         }
+
+        hotkeyVk = vk;
+        hotkeyModifiers = mods;
+        hotkeyName = HotkeyManager.FormatHotkey(vk, mods);
+        btnStart.Text = $"Start ({hotkeyName})";
+        btnStop.Text = $"Stop ({hotkeyName})";
+        lblStatus.Text = $"Ready. Press {hotkeyName} to start/stop.";
+        hotkeyManager.RegisterMain(hotkeyVk, hotkeyModifiers, hotkeyName);
     }
 
     // Rebindable panic key: Esc (default) or any F1-F12, mirroring the hotkey dialog above.
@@ -1344,7 +1393,9 @@ public partial class Form1 : Form
             return;
 
         uint vk = name == "Esc" ? 0x1Bu : (uint)(0x70 + int.Parse(name.AsSpan(1), CultureInfo.InvariantCulture) - 1);
-        if (vk == hotkeyVk)
+        // The panic key is registered unmodified, so it only clashes with an unmodified
+        // main hotkey of the same VK — Ctrl+F6 leaves plain F6 free for the panic key.
+        if (hotkeyModifiers == 0 && vk == hotkeyVk)
         {
             lblStatus.Text = $"{name} is already the start/stop hotkey — pick a different panic key.";
             return;
@@ -1364,13 +1415,13 @@ public partial class Form1 : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        hotkeyManager.RegisterMain(hotkeyVk, hotkeyName);
+        hotkeyManager.RegisterMain(hotkeyVk, hotkeyModifiers, hotkeyName);
         // Registers any profile hotkeys restored from settings. Deferred to here (rather
         // than called directly from RestoreProfiles during the constructor) for the same
         // reason RegisterMain is: RegisterHotKey needs a real HWND, and this is the
         // first point one is guaranteed to exist.
         hotkeyManager.ProfilesEnabled = chkUseProfiles is { Checked: true };
-        hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk);
+        hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk, hotkeyModifiers);
 
         // Position the empty-state overlay once the ListView's header exists — the
         // constructor's RefreshList ran before any handle did, so bounds were skipped.
@@ -1455,7 +1506,7 @@ public partial class Form1 : Form
         if (result.RegisterHotkeys)
         {
             hotkeyManager.ProfilesEnabled = true;
-            hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk);
+            hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk, hotkeyModifiers);
         }
         if (result.UnregisterHotkeys)
         {
@@ -1555,10 +1606,10 @@ public partial class Form1 : Form
         int sel = cmbProfileHotkey.SelectedIndex; // 0 = None, 1..12 = F1..F12
         uint vk = sel <= 0 ? 0u : (uint)(0x70 + (sel - 1));
 
-        var result = profileController.SetHotkey(index, vk, hotkeyVk);
+        var result = profileController.SetHotkey(index, vk, hotkeyVk, hotkeyModifiers);
         if (result.RegisterHotkeys)
         {
-            hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk);
+            hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk, hotkeyModifiers);
         }
         else
         {
@@ -1787,6 +1838,8 @@ public partial class Form1 : Form
             RunDescription = runDescription,
             CornerFailSafe = chkCornerFailSafe.Checked,
             MaxRunSeconds = (int)numMaxRunSeconds.Value,
+            MaxActions = (int)numMaxActions.Value,
+            StopOnUserMouseMove = chkStopOnMouseMove.Checked,
             RunLoggingEnabled = chkRunLogging.Checked,
             SpeedPercent = (int)numSpeed.Value,
             StartIndex = startIndex,

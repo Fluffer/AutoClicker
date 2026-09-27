@@ -201,9 +201,11 @@ internal sealed class ProfileController
     /// <summary>
     /// Assigns (or clears, with vk 0) a profile's hotkey, enforcing the collision rules:
     /// the main start/stop hotkey and F8 are rejected outright, and another profile's
-    /// hotkey is first-claimed-wins. Returns a status message either way.
+    /// hotkey is first-claimed-wins. Returns a status message either way. Profile hotkeys
+    /// carry no modifiers, so they only collide with an UNMODIFIED main hotkey of the same
+    /// VK — Ctrl+F6 leaves plain F6 free for a profile.
     /// </summary>
-    public ProfileOpResult SetHotkey(int profileIndex, uint vk, uint mainVk)
+    public ProfileOpResult SetHotkey(int profileIndex, uint vk, uint mainVk, uint mainModifiers)
     {
         if (profileIndex < 0 || profileIndex >= profiles.Count) return new ProfileOpResult();
 
@@ -211,11 +213,11 @@ internal sealed class ProfileController
 
         // Reject a collision with the main start/stop hotkey or F8 (ends recording): either
         // one would otherwise silently never fire once claimed here, or break recording.
-        if (vk != 0 && (vk == mainVk || vk == VK_F8))
+        if (vk != 0 && ((mainModifiers == 0 && vk == mainVk) || vk == VK_F8))
         {
             return new ProfileOpResult
             {
-                Status = vk == mainVk
+                Status = mainModifiers == 0 && vk == mainVk
                     ? $"F{sel} is already the start/stop hotkey — pick a different key."
                     : $"F{sel} is reserved for ending recording — pick a different key.",
             };

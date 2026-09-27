@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace AutoClicker;
 
 /// <summary>
@@ -44,6 +46,12 @@ internal sealed class RecordingAssembler
     /// <summary>A press held at least this long becomes a Click with <see cref="SeqAction.HoldMs"/>.</summary>
     internal const int HoldMinMs = 250;
 
+    /// <summary>
+    /// Consecutive printable key-downs within this many milliseconds of each other coalesce
+    /// into one <see cref="ActionKind.Text"/> action instead of a Key action per character.
+    /// </summary>
+    internal const int CoalesceWindowMs = 400;
+
     // Generic virtual-key codes for the tracked modifiers. A low-level keyboard hook reports
     // the generic code for Shift/Control/Menu (not the left/right-specific ones); the Win key
     // reports left/right-specific codes, so both are treated as the one "Win" modifier.
@@ -70,6 +78,21 @@ internal sealed class RecordingAssembler
     // Every key currently down, for auto-repeat suppression (a held key re-fires key-down).
     private readonly HashSet<int> heldKeys = new();
 
+    // Pending coalesced text (Bartels "capture keyboard as combined text"): consecutive
+    // printable key-downs accumulate here and flush as ONE Text action when a
+    // non-coalescible event arrives, a typing gap exceeds CoalesceWindowMs, or recording
+    // stops. pendingStartTs is the first character's timestamp (the Text action's delay is
+    // measured from it); pendingLastTs is the last character's (the next action's delay is
+    // measured from it).
+    private readonly StringBuilder pendingText = new();
+    private long pendingStartTs = -1;
+    private long pendingLastTs = -1;
+
+    // Text actions flushed as a side effect of a non-coalescible event. The controller
+    // drains these after each event so the recorded list keeps recording order (a word
+    // typed before a click must appear before the click).
+    private readonly Queue<RecordingEmission> flushedEmissions = new();
+
     /// <summary>The actions assembled so far, in recording order.</summary>
     internal IReadOnlyList<SeqAction> Actions => actions;
 
@@ -94,6 +117,9 @@ internal sealed class RecordingAssembler
     /// </summary>
     internal RecordingEmission? MouseUp(int button, int x, int y, long timestampMs)
     {
+        // A mouse gesture is never coalescible: any pending typed text becomes its own
+        // action before this gesture's action is emitted.
+        FlushAndEnqueue();
         if (button is < 0 or > 2 || !hasDown[button]) return null;
         hasDown[button] = false;
 
@@ -172,6 +198,8 @@ internal sealed class RecordingAssembler
     /// <summary>Records a wheel event. <paramref name="wheelDelta"/> is the raw signed delta.</summary>
     internal RecordingEmission? MouseWheel(int wheelDelta, bool horizontal, int x, int y, long timestampMs)
     {
+        // Same as MouseUp: a scroll is not coalescible, so pending text flushes first.
+        FlushAndEnqueue();
         int notches = wheelDelta / Native.WHEEL_DELTA;
         if (notches == 0) return null; // a fractional notch has no playable equivalent
 
@@ -188,9 +216,11 @@ internal sealed class RecordingAssembler
     }
 
     /// <summary>
-    /// Records a key-down. Modifier-only presses and auto-repeats are ignored; a non-modifier
-    /// key is emitted as a <see cref="ActionKind.Key"/> action whose combo carries any held
-    /// modifiers (e.g. <c>Ctrl+C</c>). F8 is never emitted. Returns the action emitted, or null.
+    /// Records a key-down. Modifier-only presses and auto-repeats are ignored. A printable
+    /// character with no held modifiers coalesces into the pending text buffer; everything
+    /// else (a modifier combo like <c>Ctrl+C</c>, a non-printable key) flushes that buffer
+    /// and is emitted as a <see cref="ActionKind.Key"/> action whose combo carries any held
+    /// modifiers. F8 is never emitted. Returns the action emitted, or null.
     /// </summary>
     internal RecordingEmission? KeyDown(int vk, long timestampMs)
     {
@@ -200,6 +230,27 @@ internal sealed class RecordingAssembler
 
         // Only emit keys whose Keys-enum name round-trips through InputSender.TryParseCombo.
         if (!Enum.IsDefined((Keys)vk)) return null;
+
+        // A printable character with no held modifier coalesces into the pending text
+        // buffer; it becomes an action only when the buffer is flushed (a non-coalescible
+        // event, a typing gap longer than CoalesceWindowMs, or the recording ending).
+        if (!HeldModifierDown() && PrintableChar(vk) is char ch)
+        {
+            if (pendingText.Length > 0 && timestampMs - pendingLastTs > CoalesceWindowMs)
+            {
+                // A pause longer than the coalescing window ends the previous word, so the
+                // pause survives replay instead of being collapsed away.
+                FlushAndEnqueue();
+            }
+            if (pendingText.Length == 0) pendingStartTs = timestampMs;
+            pendingText.Append(ch);
+            pendingLastTs = timestampMs;
+            return null;
+        }
+
+        // A modifier combo or a non-printable key: any pending typed text is its own
+        // action, and this key is a separate Key action.
+        FlushAndEnqueue();
 
         string name = ((Keys)vk).ToString();
         List<string> mods = HeldModifiers();
@@ -216,6 +267,81 @@ internal sealed class RecordingAssembler
 
     private static bool IsModifier(int vk) =>
         vk is VK_SHIFT or VK_CONTROL or VK_MENU or VK_LWIN or VK_RWIN;
+
+    private bool HeldModifierDown() =>
+        heldKeys.Contains(VK_CONTROL) || heldKeys.Contains(VK_SHIFT) ||
+        heldKeys.Contains(VK_MENU) || heldKeys.Contains(VK_LWIN) || heldKeys.Contains(VK_RWIN);
+
+    /// <summary>
+    /// The unshifted character a key types on a US layout, for the keys worth coalescing
+    /// (letters, digits, space, punctuation). Letters map to lowercase — a bare letter with
+    /// no modifier types lowercase. Null for everything else (which stays a Key action).
+    /// </summary>
+    private static char? PrintableChar(int vk) => vk switch
+    {
+        >= (int)Keys.A and <= (int)Keys.Z => (char)('a' + (vk - (int)Keys.A)),
+        >= (int)Keys.D0 and <= (int)Keys.D9 => (char)('0' + (vk - (int)Keys.D0)),
+        (int)Keys.Space => ' ',
+        (int)Keys.OemMinus => '-',
+        (int)Keys.Oemplus => '=',
+        (int)Keys.Oemcomma => ',',
+        (int)Keys.OemPeriod => '.',
+        (int)Keys.OemQuestion => '/',
+        (int)Keys.OemSemicolon => ';',
+        (int)Keys.OemQuotes => '\'',
+        (int)Keys.OemOpenBrackets => '[',
+        (int)Keys.OemCloseBrackets => ']',
+        (int)Keys.OemBackslash => '\\',
+        (int)Keys.Oemtilde => '`',
+        _ => null,
+    };
+
+    /// <summary>
+    /// Flushes the pending coalesced text as one <see cref="ActionKind.Text"/> action.
+    /// Called by the controller when recording stops (via <see cref="Flush"/>) so text typed
+    /// right before F8/right-click isn't lost.
+    /// </summary>
+    internal SeqAction? Flush() => FlushPendingText();
+
+    /// <summary>
+    /// Text actions flushed as a side effect of a non-coalescible event, in recording order.
+    /// The controller drains this after each event and reports the actions before the
+    /// event's own action.
+    /// </summary>
+    internal IReadOnlyList<RecordingEmission> TakeFlushedEmissions()
+    {
+        if (flushedEmissions.Count == 0) return Array.Empty<RecordingEmission>();
+        var list = new List<RecordingEmission>(flushedEmissions.Count);
+        while (flushedEmissions.Count > 0) list.Add(flushedEmissions.Dequeue());
+        return list;
+    }
+
+    private void FlushAndEnqueue()
+    {
+        if (FlushPendingText() is { } text)
+            flushedEmissions.Enqueue(new RecordingEmission(text, false));
+    }
+
+    /// <summary>
+    /// Turns the pending text buffer into a Text action. DelayMs is measured from the FIRST
+    /// character (the gap before the word); afterwards the action clock advances to the LAST
+    /// character, so the next action's delay is measured from the end of the word, not its
+    /// beginning — keeping replay timing exact.
+    /// </summary>
+    private SeqAction? FlushPendingText()
+    {
+        if (pendingText.Length == 0) return null;
+        var text = new SeqAction { Kind = ActionKind.Text, Text = pendingText.ToString() };
+        pendingText.Clear();
+        ResetChain();
+        text.DelayMs = lastActionTs < 0 ? 0 : (int)Math.Max(0, pendingStartTs - lastActionTs);
+        text.Normalize();
+        actions.Add(text);
+        lastActionTs = pendingLastTs;
+        pendingStartTs = -1;
+        pendingLastTs = -1;
+        return text;
+    }
 
     /// <summary>Held modifiers in the canonical combo order the parser and UI both expect.</summary>
     private List<string> HeldModifiers()
