@@ -2,6 +2,9 @@
 bin/
 obj/
 
+# Self-contained publish output (release.yml uploads it as an artifact)
+publish/
+
 # Packaging output (msix ships as a GitHub Release asset, not in git)
 installer/
 
