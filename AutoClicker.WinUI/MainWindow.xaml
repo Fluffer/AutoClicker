@@ -10,8 +10,9 @@
 
     <!--
         M2a = LAYOUT; M2b1 = the interactive core path (record, run/stop/pause/step, list
-        mutations, save/load, pick countdown, global hotkeys). The editor / find & replace /
-        schedule dialogs and the profile CRUD + hotkey rebind dialogs are still M2b2 / M3 stubs.
+        mutations, save/load, pick countdown, global hotkeys); M2b2 = profile management,
+        the two rebind dialogs and target-app auto-switch. The editor / find &amp; replace /
+        schedule dialogs are still M3 stubs.
 
         Three deliberate WinUI-native replacements for WinForms mechanisms:
           * CollapsibleSection's glyph hack     ->  Microsoft.UI.Xaml.Controls.Expander
@@ -393,11 +394,11 @@
                         <StackPanel Orientation="Horizontal" Spacing="6">
                             <TextBlock Text="Profile:" VerticalAlignment="Center" />
                             <ComboBox x:Name="ProfileCombo" Width="180" />
-                            <Button Content="New" MinWidth="138" Click="OnProfileNewClick" />
-                            <Button Content="Rename" MinWidth="138" Click="OnProfileRenameClick" />
-                            <Button Content="Duplicate" MinWidth="138" Click="OnProfileDuplicateClick" />
-                            <Button Content="Delete" MinWidth="138" Click="OnProfileDeleteClick" />
-                            <Button Content="Save to profile" MinWidth="138" Click="OnProfileSaveClick" />
+                            <Button x:Name="ProfileNewButton" Content="New" MinWidth="138" Click="OnProfileNewClick" />
+                            <Button x:Name="ProfileRenameButton" Content="Rename" MinWidth="138" Click="OnProfileRenameClick" />
+                            <Button x:Name="ProfileDuplicateButton" Content="Duplicate" MinWidth="138" Click="OnProfileDuplicateClick" />
+                            <Button x:Name="ProfileDeleteButton" Content="Delete" MinWidth="138" Click="OnProfileDeleteClick" />
+                            <Button x:Name="ProfileSaveButton" Content="Save to profile" MinWidth="138" Click="OnProfileSaveClick" />
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Spacing="6">
                             <TextBlock Text="Profile hotkey:" VerticalAlignment="Center" />

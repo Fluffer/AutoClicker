@@ -19,8 +19,9 @@ namespace AutoClicker.WinUI;
 /// <summary>
 /// The WinUI 3 twin of Form1: the full main-window layout plus (M2b1) the interactive
 /// core path — record, run/stop/pause/step, list mutations, save/load, the pick countdown
-/// and global-hotkey delivery. The editor / find &amp; replace / schedule dialogs and the
-/// profile CRUD + hotkey rebind dialogs are still tagged <c>M2b2</c> / <c>M3</c> stubs.
+/// and global-hotkey delivery — and (M2b2) profile management, the start/stop and panic
+/// rebind dialogs, and target-app auto-switching. The editor / find &amp; replace / schedule
+/// dialogs are still tagged <c>M3</c> stubs.
 /// </summary>
 /// <remarks>
 /// Row order mirrors <c>Form1.BuildUi</c>: toolbar, then the sections (interval, options +
@@ -68,7 +69,6 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private readonly AppSettings _settings;
     private readonly List<SeqAction> _points = new();
-    private List<Profile> _profiles = new();
 
     // Every Expander that persists a CollapsedSections key, with that key. The two
     // side-by-side pairs share one key, so collapsing either half collapses both — which is
@@ -91,6 +91,22 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly HotkeyManager _hotkeyManager;
     private readonly RecordingController _recordingController;
     private readonly RunController _runController;
+
+    // M2b2: the profile business logic lives in Core, exactly as it does for Form1. The
+    // window only applies each ProfileOpResult to its controls, so the two UIs cannot
+    // drift apart on the semantics (auto-save on switch, collision rules, the load-failed
+    // save gate).
+    private readonly ProfileController _profileController;
+
+    // Form1's suppressProfileEvents: guards the profile combo/hotkey combo against
+    // re-entering the switch/set-hotkey logic while they are being repopulated
+    // programmatically. Every read-only sync of those two combos goes through it.
+    private bool _suppressProfileEvents;
+
+    // The 1.5 s per-app auto-switch poller (Form1's autoSwitchTimer). Created in the
+    // constructor for the same reason the run timer is: it must exist before the display
+    // restore can arm or disarm it.
+    private DispatcherQueueTimer? _autoSwitchTimer;
 
     // Hotkey / panic-key state, mirrored from settings on load and re-captured on close.
     // Form1 keeps the same three fields per key, because the rebind dialogs (M2b2) mutate
@@ -167,6 +183,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         _hotkeyManager = new HotkeyManager(() => _hwnd, SetStatus);
         _recordingController = new RecordingController();
+        _profileController = new ProfileController();
         // Form1's exact construction, including the two lambdas that arm/disarm the panic
         // key per run against the live checkbox and the current panic VK.
         _runController = new RunController(
@@ -184,12 +201,19 @@ public sealed partial class MainWindow : Window, IDisposable
         _runTimer.IsRepeating = true;
         _runTimer.Tick += (_, _) => UpdateRunTimerTick();
 
+        // Form1's autoSwitchTimer: 1500 ms, armed only while it could actually switch.
+        _autoSwitchTimer = DispatcherQueue.CreateTimer();
+        _autoSwitchTimer.Interval = TimeSpan.FromMilliseconds(1500);
+        _autoSwitchTimer.IsRepeating = true;
+        _autoSwitchTimer.Tick += (_, _) => AutoSwitchTick();
+
         // Physical pixels: give the first measure pass a realistic width instead of WinUI's
         // default, then let the Loaded pass below replace it with the content's size.
         AppWindow.Resize(new SizeInt32(ProvisionalWidthPhysical, ProvisionalHeightPhysical));
 
         WireSectionExpanders();
         WireDependentEnablement();
+        WireProfileEvents();
         ApplyDisplayState();
 
         // The global hotkeys need a real HWND — Form1 defers the same calls to
@@ -198,7 +222,7 @@ public sealed partial class MainWindow : Window, IDisposable
         InstallHotkeyHook();
         _hotkeyManager.RegisterMain(_hotkeyVk, _hotkeyModifiers, _hotkeyName);
         _hotkeyManager.ProfilesEnabled = UseProfilesCheck.IsChecked == true;
-        _hotkeyManager.RegisterProfiles(_profiles, _hotkeyVk, _hotkeyModifiers);
+        _hotkeyManager.RegisterProfiles(_profileController.Profiles, _hotkeyVk, _hotkeyModifiers);
 
         Closed += OnWindowClosed;
 
@@ -210,8 +234,8 @@ public sealed partial class MainWindow : Window, IDisposable
     /// Form1.WireEvents, one subscriber at a time. Two deliberate WinUI differences: the
     /// run callbacks that arrive on the WORKER thread are marshalled here — WinForms let
     /// Form1 touch controls from that thread only because it disables its cross-thread check
-    /// outside the debugger, whereas WinUI throws — and the profile hotkey handler stays an
-    /// M2b2 stub because there is no ProfileController yet.
+    /// outside the debugger, whereas WinUI throws — and the profile hotkey handler is
+    /// marshalled because it can arrive while a run is unwinding on the worker thread.
     /// </summary>
     private void WireControllerEvents()
     {
@@ -223,10 +247,9 @@ public sealed partial class MainWindow : Window, IDisposable
         _hotkeyManager.EndRecordingPressed += () => { if (_recordingController.IsRecording) StopRecording(); };
         _hotkeyManager.PanicPressed += () => _runController.PanicStop();
         _hotkeyManager.PausePressed += TogglePause;
-        _hotkeyManager.ProfileHotkeyPressed += _ =>
-        {
-            // M2b2: switch to the profile and start it (ProfileController.SwitchTo + StartClicking).
-        };
+        // WM_HOTKEY is raised from the window procedure on the UI thread, so no marshal is
+        // needed for the switch itself; the status/combo writes it makes are all UI-thread.
+        _hotkeyManager.ProfileHotkeyPressed += HandleProfileHotkey;
 
         _recordingController.ActionRecorded += AddRecordedAction;
         _recordingController.EndRecordingRequested += StopRecording;
@@ -267,6 +290,27 @@ public sealed partial class MainWindow : Window, IDisposable
     private void OnDependentToggleChanged(object sender, RoutedEventArgs e) => UpdateEnabledState();
 
     private void OnDependentSelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateEnabledState();
+
+    /// <summary>
+    /// The profile controls' own events, wired like Form1 wires them in BuildUi. The combo
+    /// handlers are no-ops while <see cref="_suppressProfileEvents"/> is set, so the
+    /// programmatic syncing in <see cref="RefreshProfileCombo"/>,
+    /// <see cref="UpdateProfileHotkeyCombo"/> and the restore cannot re-enter the profile
+    /// switch / hotkey-assignment logic.
+    /// </summary>
+    private void WireProfileEvents()
+    {
+        UseProfilesCheck.Checked += OnUseProfilesChanged;
+        UseProfilesCheck.Unchecked += OnUseProfilesChanged;
+        ProfileCombo.SelectionChanged += OnProfileComboChanged;
+        ProfileHotkeyCombo.SelectionChanged += OnProfileHotkeyComboChanged;
+        // WinForms used the TextBox's Validated event; WinUI's nearest equivalent is the
+        // focus loss (Validated has no WinUI counterpart and a programmatic Text write does
+        // not raise LostFocus either, so the same "only user edits re-save" property holds).
+        TargetProcessBox.LostFocus += OnTargetProcessLostFocus;
+        AutoSwitchCheck.Checked += OnAutoSwitchChanged;
+        AutoSwitchCheck.Unchecked += OnAutoSwitchChanged;
+    }
 
     /// <summary>
     /// One-shot startup: the WinForms original sized itself to its content (AutoSize +
@@ -432,51 +476,55 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     /// <summary>
-    /// Display-only profile restore: populates the combo and the active profile's own fields.
-    /// No profile controller, no hotkey registration, no auto-switch timer.
+    /// Form1.RestoreProfiles: loads profiles.json into the controller, populates the combo
+    /// and the active profile's own fields, and takes over the point list only when profiles
+    /// are actually in use. Every write is inside the suppression guard so the combo and
+    /// checkbox events cannot fire mid-restore against half-loaded state; hotkey
+    /// registration stays where it was (the constructor, once the HWND exists).
     /// </summary>
     private void RestoreProfiles()
     {
-        _profiles = ProfileStore.Load(out bool loadFailed);
-        if (loadFailed)
+        _profileController.Load(_settings);
+        if (_profileController.LoadFailed)
         {
+            // Verbatim Form1.RestoreProfiles (the line break Form1 uses is dropped: the WinUI
+            // status TextBlock is NoWrap, so \r\n would be invisible anyway).
             SetStatus("Could not read profiles.json \u2014 it has been kept as profiles.json.corrupt "
                     + "and profile saving is disabled this session so it can't be overwritten.");
         }
 
-        foreach (Profile profile in _profiles) ProfileCombo.Items.Add(profile.Name);
-
+        // The hotkey combo's item list is static ("None" + F1..F12) and only ever built here.
+        ProfileHotkeyCombo.Items.Clear();
         ProfileHotkeyCombo.Items.Add("None");
         for (int i = 1; i <= 12; i++) ProfileHotkeyCombo.Items.Add("F" + i.ToString(CultureInfo.InvariantCulture));
-        ProfileHotkeyCombo.SelectedIndex = 0;
 
-        if (_profiles.Count == 0) return;
-
-        ProfileCombo.SelectedIndex = 0;
-        int active = IndexOfProfile(_settings.ActiveProfileName);
-        if (active >= 0) ProfileCombo.SelectedIndex = active;
-
-        Profile selected = _profiles[ProfileCombo.SelectedIndex];
-        TargetProcessBox.Text = selected.TargetProcess;
-        // Item 0 is "None"; item N is "FN". HotkeyVk 0 means no hotkey at all.
-        int hotkeyIndex = selected.HotkeyVk == 0 ? 0 : (int)(selected.HotkeyVk - 0x70) + 1;
-        ProfileHotkeyCombo.SelectedIndex = hotkeyIndex is >= 0 and <= 12 ? hotkeyIndex : 0;
-
-        // Same rule as Form1.RestoreProfiles: only take over the list when profiles are
-        // actually in use, otherwise the ad-hoc sequence restored above must stand.
-        if (_settings.UseProfiles)
+        _suppressProfileEvents = true;
+        try
         {
+            ProfileCombo.Items.Clear();
+            foreach (Profile p in _profileController.Profiles) ProfileCombo.Items.Add(p.Name);
+
+            UseProfilesCheck.IsChecked = _settings.UseProfiles;
+
+            if (_profileController.Profiles.Count > 0 && _profileController.ActiveProfileIndex >= 0)
+                ProfileCombo.SelectedIndex = _profileController.ActiveProfileIndex;
+        }
+        finally { _suppressProfileEvents = false; }
+
+        // Only load the profile's actions over `points` when profiles are actually in use —
+        // otherwise RestoreLastSequence's ad-hoc sequence (already loaded above) must stand.
+        if (_settings.UseProfiles && _profileController.ActiveProfileIndex >= 0)
+        {
+            Profile p = _profileController.Profiles[_profileController.ActiveProfileIndex];
             _points.Clear();
-            foreach (SeqAction action in selected.Actions) _points.Add(action.Clone());
+            foreach (SeqAction action in p.Actions) _points.Add(action.Clone());
             UseSequenceCheck.IsChecked = _points.Count > 0;
         }
-    }
 
-    private int IndexOfProfile(string name)
-    {
-        for (int i = 0; i < _profiles.Count; i++)
-            if (string.Equals(_profiles[i].Name, name, StringComparison.Ordinal)) return i;
-        return -1;
+        UpdateProfileHotkeyCombo();
+        UpdateProfileTargetProcess();
+        UpdateProfileControlsEnabled();
+        UpdateAutoSwitchTimer();
     }
 
     /// <summary>Renders the sequence list, the summary counts and the empty state.</summary>
@@ -541,6 +589,375 @@ public sealed partial class MainWindow : Window, IDisposable
         if (kind is ActionKind.FindImage or ActionKind.FindText) return _visualTint;
         if (kind is ActionKind.Wait or ActionKind.WaitPixel) return _waitTint;
         return _noTint; // "no tint": pixel-gated and everything else stay list-coloured
+    }
+
+    // =====================================================================
+    // M2b2: profile management, the rebind dialogs and target-app auto-switch.
+    // Every business decision lives in Core (ProfileController /
+    // ProfileAutoSwitcher); this region is Form1's apply/glue only, so the
+    // WinForms and WinUI builds cannot disagree about semantics.
+    // =====================================================================
+
+    /// <summary>
+    /// Form1.RefreshProfileCombo: repopulates the combo from the controller's list, then
+    /// re-selects a profile by name (its index may have shifted). Suppressed so it never
+    /// re-triggers the switch logic.
+    /// </summary>
+    private void RefreshProfileCombo(string? selectName)
+    {
+        _suppressProfileEvents = true;
+        try
+        {
+            ProfileCombo.Items.Clear();
+            foreach (Profile p in _profileController.Profiles) ProfileCombo.Items.Add(p.Name);
+            if (selectName != null)
+            {
+                int idx = _profileController.IndexByName(selectName);
+                if (idx >= 0) ProfileCombo.SelectedIndex = idx;
+            }
+        }
+        finally { _suppressProfileEvents = false; }
+    }
+
+    /// <summary>
+    /// Form1.ApplyProfileResult: applies a profile operation's outcome to the controls.
+    /// <c>NewPoints</c> replaces the on-screen sequence, <c>SelectProfileName</c> re-selects
+    /// after a combo repopulation, and the flags drive hotkey re-registration / the ad-hoc
+    /// sequence reload.
+    /// </summary>
+    private void ApplyProfileResult(ProfileOpResult result)
+    {
+        if (result.NewPoints is not null)
+        {
+            // _points is readonly in this window, so the list is replaced in place rather
+            // than re-pointed the way Form1 does (`points = result.NewPoints`).
+            _points.Clear();
+            _points.AddRange(result.NewPoints);
+            RefreshList();
+            UseSequenceCheck.IsChecked = _points.Count > 0;
+        }
+        if (result.SelectProfileName is not null)
+            RefreshProfileCombo(result.SelectProfileName);
+        _settings.ActiveProfileName = _profileController.ActiveProfileName ?? "";
+        if (result.Status is not null) SetStatus(result.Status);
+        if (result.RegisterHotkeys)
+        {
+            _hotkeyManager.ProfilesEnabled = true;
+            _hotkeyManager.RegisterProfiles(_profileController.Profiles, _hotkeyVk, _hotkeyModifiers);
+        }
+        if (result.UnregisterHotkeys)
+        {
+            _hotkeyManager.ProfilesEnabled = false;
+            _hotkeyManager.UnregisterProfiles();
+        }
+        if (result.ReloadAdHocSequence) RestoreLastSequence();
+        UpdateProfileHotkeyCombo();
+        UpdateProfileTargetProcess();
+        UpdateProfileControlsEnabled();
+        UpdateAutoSwitchTimer();
+    }
+
+    private void OnProfileComboChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressProfileEvents) return;
+        SwitchToProfile(ProfileCombo.SelectedIndex);
+    }
+
+    // SwitchToProfile auto-saves the outgoing profile's edits inside the controller, so a
+    // switch can never silently discard a recorded sequence.
+    private void SwitchToProfile(int newIndex)
+        => ApplyProfileResult(_profileController.SwitchTo(newIndex, _points));
+
+    private async void OnProfileNewClick(object sender, RoutedEventArgs e)
+    {
+        string? name = await PromptForNameAsync("New profile", "Profile name:", "");
+        if (name == null) return;
+        ApplyProfileResult(_profileController.NewProfile(name, _points));
+    }
+
+    private async void OnProfileRenameClick(object sender, RoutedEventArgs e)
+    {
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+        string? name = await PromptForNameAsync("Rename profile", "Profile name:", _profileController.Profiles[index].Name);
+        if (name == null) return;
+        ApplyProfileResult(_profileController.RenameProfile(name));
+    }
+
+    private void OnProfileDuplicateClick(object sender, RoutedEventArgs e)
+    {
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+        ApplyProfileResult(_profileController.DuplicateProfile(_points));
+    }
+
+    private async void OnProfileDeleteClick(object sender, RoutedEventArgs e)
+    {
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+        Profile p = _profileController.Profiles[index];
+
+        if (_dialogOpen) return;
+        // Form1's MessageBox wording and its "No" default, as a ContentDialog. The primary
+        // button is "Yes" and the close button "No", with Close as the default — the same
+        // safe-default gesture as MessageBoxDefaultButton.Button2.
+        var dialog = new ContentDialog
+        {
+            Title = "Delete profile",
+            Content = $"Delete profile \"{p.Name}\"? This permanently removes its saved sequence.",
+            PrimaryButtonText = "Yes",
+            CloseButtonText = "No",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Root.XamlRoot,
+        };
+        _dialogOpen = true;
+        ContentDialogResult result;
+        try { result = await dialog.ShowAsync(); }
+        finally { _dialogOpen = false; }
+        if (result != ContentDialogResult.Primary) return;
+
+        ApplyProfileResult(_profileController.DeleteProfile(index, _points));
+        if (_profileController.Profiles.Count == 0)
+        {
+            _points.Clear();
+            RefreshList();
+        }
+    }
+
+    private void OnProfileSaveClick(object sender, RoutedEventArgs e)
+    {
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count)
+        {
+            SetStatus("Select a profile first.");
+            return;
+        }
+        _profileController.SaveCurrentPointsToProfile(index, _points);
+        SetStatus($"Saved {_points.Count} actions to \"{_profileController.Profiles[index].Name}\".");
+    }
+
+    /// <summary>
+    /// Form1.PromptForName's title/prompt/initial value and OK/Cancel shape; the
+    /// <c>_dialogOpen</c> guard is mandatory (a second concurrent ShowAsync faults inside
+    /// Microsoft.UI.Xaml.dll, which is not catchable).
+    /// </summary>
+    private async Task<string?> PromptForNameAsync(string title, string prompt, string initialValue)
+    {
+        if (_dialogOpen) return null;
+
+        var input = new TextBox { Text = initialValue, Width = 280 };
+        input.Loaded += (_, _) => input.SelectAll();
+        var panel = new StackPanel { Spacing = 8 };
+        panel.Children.Add(new TextBlock { Text = prompt, TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(input);
+
+        var dialog = new ContentDialog
+        {
+            Title = title,
+            Content = panel,
+            PrimaryButtonText = "OK",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot,
+        };
+
+        _dialogOpen = true;
+        ContentDialogResult result;
+        try { result = await dialog.ShowAsync(); }
+        finally { _dialogOpen = false; }
+
+        return result == ContentDialogResult.Primary ? input.Text : null;
+    }
+
+    /// <summary>
+    /// Form1.UpdateProfileHotkeyCombo: syncs the hotkey combo to the active profile's
+    /// assignment. Item 0 is "None"; item N is "FN".
+    /// </summary>
+    private void UpdateProfileHotkeyCombo()
+    {
+        // Before RestoreProfiles has built the item list a selection write would be out of
+        // range (WinUI throws where WinForms quietly clamped), so bail out.
+        if (ProfileHotkeyCombo.Items.Count == 0) return;
+
+        _suppressProfileEvents = true;
+        try
+        {
+            if (_profileController.ActiveProfileIndex < 0 || _profileController.ActiveProfileIndex >= _profileController.Profiles.Count)
+            {
+                ProfileHotkeyCombo.SelectedIndex = 0; // "None"
+                return;
+            }
+            uint vk = _profileController.Profiles[_profileController.ActiveProfileIndex].HotkeyVk;
+            ProfileHotkeyCombo.SelectedIndex = vk == 0 ? 0 : (int)(vk - 0x70 + 1);
+        }
+        finally { _suppressProfileEvents = false; }
+    }
+
+    /// <summary>
+    /// Form1.CmbProfileHotkey_SelectedIndexChanged: assigns (or clears, on "None") the active
+    /// profile's hotkey through the controller's collision rules. A rejected assignment
+    /// re-syncs the combo to the profile's actual (unchanged) hotkey and shows the reason.
+    /// </summary>
+    private void OnProfileHotkeyComboChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressProfileEvents) return;
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+
+        int sel = ProfileHotkeyCombo.SelectedIndex; // 0 = None, 1..12 = F1..F12
+        uint vk = sel <= 0 ? 0u : (uint)(0x70 + (sel - 1));
+
+        ProfileOpResult result = _profileController.SetHotkey(index, vk, _hotkeyVk, _hotkeyModifiers);
+        if (result.RegisterHotkeys)
+        {
+            _hotkeyManager.RegisterProfiles(_profileController.Profiles, _hotkeyVk, _hotkeyModifiers);
+        }
+        else
+        {
+            UpdateProfileHotkeyCombo(); // revert to the profile's actual (unchanged) hotkey
+        }
+        if (result.Status is not null) SetStatus(result.Status);
+    }
+
+    /// <summary>
+    /// Form1.UpdateProfileTargetProcess: sets the target-process box to the active profile's
+    /// value. Programmatic, so (as with Form1's Validated handler) it never re-saves by itself.
+    /// </summary>
+    private void UpdateProfileTargetProcess()
+    {
+        if (_profileController.ActiveProfileIndex < 0 || _profileController.ActiveProfileIndex >= _profileController.Profiles.Count)
+        {
+            TargetProcessBox.Text = "";
+            return;
+        }
+        TargetProcessBox.Text = _profileController.Profiles[_profileController.ActiveProfileIndex].TargetProcess;
+    }
+
+    /// <summary>Form1.SaveTargetProcess on the box's focus loss — persist the typed value.</summary>
+    private void OnTargetProcessLostFocus(object sender, RoutedEventArgs e)
+    {
+        int index = _profileController.ActiveProfileIndex;
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+        _profileController.SetTargetProcess(TargetProcessBox.Text);
+        UpdateAutoSwitchTimer();
+    }
+
+    /// <summary>Form1's chkAutoSwitch.CheckedChanged.</summary>
+    private void OnAutoSwitchChanged(object sender, RoutedEventArgs e)
+    {
+        _settings.ProfileAutoSwitch = AutoSwitchCheck.IsChecked == true;
+        UpdateAutoSwitchTimer();
+    }
+
+    /// <summary>Form1.OnUseProfilesChanged: load points / save outgoing / re-arm the poller.</summary>
+    private void OnUseProfilesChanged(object sender, RoutedEventArgs e)
+    {
+        _settings.UseProfiles = UseProfilesCheck.IsChecked == true;
+        ApplyProfileResult(_profileController.SetEnabled(UseProfilesCheck.IsChecked == true, _points));
+    }
+
+    /// <summary>Form1.UpdateProfileControlsEnabled: the profile row's greying.</summary>
+    private void UpdateProfileControlsEnabled()
+    {
+        bool on = UseProfilesCheck.IsChecked == true;
+        bool hasSelection = on && _profileController.ActiveProfileIndex >= 0
+            && _profileController.ActiveProfileIndex < _profileController.Profiles.Count;
+        ProfileCombo.IsEnabled = on && _profileController.Profiles.Count > 0;
+        ProfileNewButton.IsEnabled = on;
+        ProfileRenameButton.IsEnabled = hasSelection;
+        ProfileDuplicateButton.IsEnabled = hasSelection;
+        ProfileDeleteButton.IsEnabled = hasSelection;
+        ProfileSaveButton.IsEnabled = hasSelection;
+        ProfileHotkeyCombo.IsEnabled = hasSelection;
+        TargetProcessBox.IsEnabled = hasSelection;
+        AutoSwitchCheck.IsEnabled = on;
+    }
+
+    /// <summary>
+    /// Form1.AutoSwitchEnabled: arms the 1.5 s poller only while it can actually do
+    /// something — profiles on, the global opt-out off, at least one profile has a target,
+    /// and nothing running or recording. Called from every place that can change those.
+    /// </summary>
+    private bool AutoSwitchEnabled =>
+        UseProfilesCheck.IsChecked == true
+        && _settings.ProfileAutoSwitch
+        && !_runController.IsRunning
+        && !_recordingController.IsRecording
+        && _profileController.Profiles.Any(p => !string.IsNullOrWhiteSpace(p.TargetProcess));
+
+    private void UpdateAutoSwitchTimer()
+    {
+        if (AutoSwitchEnabled) _autoSwitchTimer?.Start();
+        else _autoSwitchTimer?.Stop();
+    }
+
+    /// <summary>
+    /// Form1.AutoSwitchTick, on a DispatcherQueueTimer: resolve the foreground window's
+    /// process and, if it matches a profile's target other than the one already active,
+    /// switch to that profile. Runs on the UI thread (the DispatcherQueueTimer's tick), so
+    /// the controls it touches need no marshalling.
+    /// </summary>
+    private void AutoSwitchTick()
+    {
+        if (_runController.IsRunning || _recordingController.IsRecording) return;
+        if (UseProfilesCheck.IsChecked != true || !_settings.ProfileAutoSwitch) { _autoSwitchTimer?.Stop(); return; }
+
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero) return;
+        uint tid = GetWindowThreadProcessId(hwnd, out uint pid);
+        if (tid == 0 || pid == 0) return;
+
+        string fgName;
+        try { fgName = Process.GetProcessById((int)pid).ProcessName; }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                                      or System.ComponentModel.Win32Exception) { return; }
+        if (string.IsNullOrEmpty(fgName)) return;
+
+        int idx = ProfileAutoSwitcher.ChooseTarget(
+            _profileController.Profiles.Select(p => p.TargetProcess).ToList(), fgName);
+        if (idx < 0 || idx == _profileController.ActiveProfileIndex) return;
+
+        // Hysteresis: if the foreground process already matches the CURRENT profile's target,
+        // we're where we should be — don't bounce to another profile sharing the same target.
+        if (_profileController.ActiveProfileIndex >= 0 && _profileController.ActiveProfileIndex < _profileController.Profiles.Count)
+        {
+            string current = _profileController.Profiles[_profileController.ActiveProfileIndex].TargetProcess;
+            if (!string.IsNullOrEmpty(current) &&
+                string.Equals(ProfileAutoSwitcher.NormalizeProcessName(current),
+                    ProfileAutoSwitcher.NormalizeProcessName(fgName), StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        SwitchToProfile(idx);
+        _suppressProfileEvents = true;
+        try { ProfileCombo.SelectedIndex = idx; }
+        finally { _suppressProfileEvents = false; }
+        SetStatus($"Auto-switched to profile \"{_profileController.Profiles[idx].Name}\" (target detected).");
+    }
+
+    /// <summary>
+    /// Form1.HandleProfileHotkey: a profile hotkey both selects that profile and starts it,
+    /// routed through the same StartClicking() the toolbar Start button and the main hotkey
+    /// use, so the busy claim, start-delay countdown and panic-key registration all still
+    /// apply. Refused outright while a run owns the engine, for the reasons Form1 documents.
+    /// </summary>
+    private void HandleProfileHotkey(int index)
+    {
+        if (index < 0 || index >= _profileController.Profiles.Count) return;
+
+        if (_runController.IsBusy || _runController.IsRunning)
+        {
+            SetStatus($"Stop the current run before switching to \"{_profileController.Profiles[index].Name}\".");
+            return;
+        }
+
+        SwitchToProfile(index);
+        _suppressProfileEvents = true;
+        try { ProfileCombo.SelectedIndex = index; }
+        finally { _suppressProfileEvents = false; }
+        UpdateProfileHotkeyCombo();
+
+        StartClicking();
     }
 
     /// <summary>
@@ -837,6 +1254,8 @@ public sealed partial class MainWindow : Window, IDisposable
             _runTimer.Stop();
             RunTimerText.Text = "";
         }
+
+        UpdateAutoSwitchTimer();
     }
 
     /// <summary>
@@ -1182,10 +1601,9 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         if (_runController.IsRunning) { SetStatus("Stop clicking before recording."); return; }
         // Profile hotkeys stop a recording when pressed, so their keydowns must not survive
-        // into the recorded sequence as stray Key actions. M2b1 has no ProfileController yet,
-        // so the list comes from the profiles.json snapshot this window already loaded.
+        // into the recorded sequence as stray Key actions.
         _recordingController.AdditionalFilteredVks.Clear();
-        foreach (Profile p in _profiles)
+        foreach (Profile p in _profileController.Profiles)
             if (p.HotkeyVk != 0) _recordingController.AdditionalFilteredVks.Add(p.HotkeyVk);
 
         if (_recordingController.Start(_hwnd, _hotkeyVk, SetStatus, MarshalToUi))
@@ -1198,6 +1616,8 @@ public sealed partial class MainWindow : Window, IDisposable
             UpdateStateLabel();
             SetStatus("RECORDING: 0 actions — clicks and keys still reach their apps. Right-click or F8 to finish.");
         }
+
+        UpdateAutoSwitchTimer();
     }
 
     private void StopRecording()
@@ -1213,6 +1633,7 @@ public sealed partial class MainWindow : Window, IDisposable
         UpdateStateLabel();
         int recorded = _points.Count - _recordStartCount;
         SetStatus($"Recording finished. {recorded} action{(recorded == 1 ? "" : "s")} in {FormatDuration(elapsed)}.");
+        UpdateAutoSwitchTimer();
     }
 
     // ---- Hotkey delivery: the WM_HOTKEY hook + rebind/pick close-out ----
@@ -1281,8 +1702,11 @@ public sealed partial class MainWindow : Window, IDisposable
     // ---- Settings capture + shutdown (Form1.OnFormClosing) ----
 
     /// <summary>
-    /// Form1.CaptureSettingsFromControls. The profile block is M2b2 (there is no
-    /// ProfileController yet), so UseProfiles is captured but no profile is written back.
+    /// Form1.CaptureSettingsFromControls. The profile block is Form1's verbatim: the active
+    /// profile's name is re-asserted, the target-process box is persisted (it only saves on
+    /// focus loss otherwise) and the on-screen points are written back, so closing while
+    /// mid-edit on a profile can never silently discard that edit. ProfileController's own
+    /// save gate still refuses every write when profiles.json failed to load.
     /// </summary>
     private void CaptureSettingsFromControls()
     {
@@ -1322,6 +1746,18 @@ public sealed partial class MainWindow : Window, IDisposable
         _settings.ProfileAutoSwitch = AutoSwitchCheck.IsChecked == true;
         _settings.CollapsedSections = CollapsedSections.Serialize(
             _sectionExpanders.Where(pair => !pair.Expander.IsExpanded).Select(pair => pair.Key));
+
+        // ActiveProfileName is kept in sync as profiles are switched, created, renamed or
+        // deleted; re-assert it here too and persist whatever is currently on screen, so
+        // closing the app while mid-edit on a profile never silently discards that edit.
+        if (UseProfilesCheck.IsChecked == true
+            && _profileController.ActiveProfileIndex >= 0
+            && _profileController.ActiveProfileIndex < _profileController.Profiles.Count)
+        {
+            _settings.ActiveProfileName = _profileController.Profiles[_profileController.ActiveProfileIndex].Name;
+            _profileController.SetTargetProcess(TargetProcessBox.Text);
+            _profileController.SaveCurrentPointsToProfile(_profileController.ActiveProfileIndex, _points);
+        }
     }
 
     /// <summary>
@@ -1344,6 +1780,8 @@ public sealed partial class MainWindow : Window, IDisposable
         _pickDone = null;
 
         _runTimer.Stop();
+        _autoSwitchTimer?.Stop();
+        _autoSwitchTimer = null;
 
         // Must run before Join below: if a start-delay countdown is pending, `worker` holds a
         // Thread that was built but never started, and Thread.Join throws on one of those.
@@ -1428,43 +1866,145 @@ public sealed partial class MainWindow : Window, IDisposable
         // M3: the Find & Replace dialog.
     }
 
-    private void OnRebindPanicKeyClick(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// Form1.RebindPanicKey as a ContentDialog: pick Esc or any F1-F12. Collisions with the
+    /// main start/stop hotkey or F8 are rejected with Form1's exact status lines —
+    /// RegisterPanic would silently fail to arm either way once those keys are claimed.
+    /// </summary>
+    private async void OnRebindPanicKeyClick(object sender, RoutedEventArgs e)
     {
-        // M2b2: capture Esc / F1-F12 and re-register the panic hotkey.
+        if (_dialogOpen) return;
+
+        var combo = new ComboBox { Width = 120 };
+        combo.Items.Add("Esc");
+        for (int i = 1; i <= 12; i++) combo.Items.Add("F" + i.ToString(CultureInfo.InvariantCulture));
+        combo.SelectedItem = _panicKeyName;
+        if (combo.SelectedIndex < 0) combo.SelectedIndex = 0;
+
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        panel.Children.Add(new TextBlock { Text = "Panic key:", VerticalAlignment = VerticalAlignment.Center });
+        panel.Children.Add(combo);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Panic key setting",
+            Content = panel,
+            PrimaryButtonText = "OK",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot,
+        };
+        _dialogOpen = true;
+        ContentDialogResult result;
+        try { result = await dialog.ShowAsync(); }
+        finally { _dialogOpen = false; }
+        if (result != ContentDialogResult.Primary || combo.SelectedItem is not string name) return;
+
+        uint vk = name == "Esc" ? 0x1Bu : (uint)(0x70 + int.Parse(name.AsSpan(1), CultureInfo.InvariantCulture) - 1);
+        // The panic key is registered unmodified, so it only clashes with an unmodified
+        // main hotkey of the same VK — Ctrl+F6 leaves plain F6 free for the panic key.
+        if (_hotkeyModifiers == 0 && vk == _hotkeyVk)
+        {
+            SetStatus($"{name} is already the start/stop hotkey — pick a different panic key.");
+            return;
+        }
+        if (vk == 0x77) // F8 ends recording
+        {
+            SetStatus("F8 is reserved for ending recording — pick a different panic key.");
+            return;
+        }
+
+        _panicKeyVk = vk;
+        _panicKeyName = name;
+        PanicKeyButton.Content = "Panic key: " + name;
+        SetStatus($"Panic key set to {name}. It is only active while a run is running.");
     }
 
-    private void OnHotkeyClick(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// Form1.BtnHotkey_Click as a ContentDialog: an F1-F12 / A-Z / 0-9 key list plus the four
+    /// modifier checkboxes. A letter or digit without a modifier is refused (the same
+    /// Normalize rule the settings restore enforces) and nothing is written back. Status
+    /// feedback for a key already claimed by another app comes from HotkeyManager's
+    /// reportStatus callback, not from here.
+    /// </summary>
+    private async void OnHotkeyClick(object sender, RoutedEventArgs e)
     {
-        // M2b2: capture the start/stop hotkey and re-register it.
+        if (_dialogOpen) return;
+
+        // F1-F12, then A-Z, then 0-9. Letters/digits need at least one modifier (enforced
+        // below), matching the Normalize rule.
+        var keys = new List<(string Name, uint Vk)>();
+        for (int i = 1; i <= 12; i++) keys.Add(($"F{i}", (uint)(0x70 + i - 1)));
+        for (char c = 'A'; c <= 'Z'; c++) keys.Add((c.ToString(), c));
+        for (char c = '0'; c <= '9'; c++) keys.Add((c.ToString(), c));
+
+        var keyCombo = new ComboBox { Width = 176 };
+        foreach ((string name, _) in keys) keyCombo.Items.Add(name);
+        int currentIndex = _hotkeyVk is >= 0x70 and <= 0x7B ? (int)(_hotkeyVk - 0x70)
+            : _hotkeyVk is >= 0x41 and <= 0x5A ? 12 + (int)(_hotkeyVk - 0x41)
+            : _hotkeyVk is >= 0x30 and <= 0x39 ? 12 + 26 + (int)(_hotkeyVk - 0x30)
+            : 5; // F6
+        keyCombo.SelectedIndex = currentIndex;
+
+        var ctrl = new CheckBox { Content = "Ctrl", IsChecked = (_hotkeyModifiers & HotkeyManager.ModCtrl) != 0 };
+        var alt = new CheckBox { Content = "Alt", IsChecked = (_hotkeyModifiers & HotkeyManager.ModAlt) != 0 };
+        var shift = new CheckBox { Content = "Shift", IsChecked = (_hotkeyModifiers & HotkeyManager.ModShift) != 0 };
+        var win = new CheckBox { Content = "Win", IsChecked = (_hotkeyModifiers & HotkeyManager.ModWin) != 0 };
+
+        var keyRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        keyRow.Children.Add(new TextBlock { Text = "Start/Stop hotkey:", VerticalAlignment = VerticalAlignment.Center });
+        keyRow.Children.Add(keyCombo);
+        var modRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        modRow.Children.Add(ctrl);
+        modRow.Children.Add(alt);
+        modRow.Children.Add(shift);
+        modRow.Children.Add(win);
+        var panel = new StackPanel { Spacing = 10 };
+        panel.Children.Add(keyRow);
+        panel.Children.Add(modRow);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Hotkey setting",
+            Content = panel,
+            PrimaryButtonText = "OK",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot,
+        };
+        _dialogOpen = true;
+        ContentDialogResult result;
+        try { result = await dialog.ShowAsync(); }
+        finally { _dialogOpen = false; }
+        if (result != ContentDialogResult.Primary) return;
+
+        uint vk = keys[keyCombo.SelectedIndex].Vk;
+        uint mods = 0;
+        if (ctrl.IsChecked == true) mods |= HotkeyManager.ModCtrl;
+        if (alt.IsChecked == true) mods |= HotkeyManager.ModAlt;
+        if (shift.IsChecked == true) mods |= HotkeyManager.ModShift;
+        if (win.IsChecked == true) mods |= HotkeyManager.ModWin;
+
+        bool isFunctionKey = vk is >= 0x70 and <= 0x7B;
+        if (mods == 0 && !isFunctionKey)
+        {
+            SetStatus("A letter or digit needs at least one modifier (Ctrl/Alt/Shift/Win) — only F1-F12 work alone.");
+            return;
+        }
+
+        _hotkeyVk = vk;
+        _hotkeyModifiers = mods;
+        _hotkeyName = HotkeyManager.FormatHotkey(vk, mods);
+        StartButton.Content = $"Start ({_hotkeyName})";
+        StopRunButton.Content = $"Stop ({_hotkeyName})";
+        SetStatus($"Ready. Press {_hotkeyName} to start/stop.");
+        // RegisterMain re-registers the toggle (and F8), reporting any "already claimed" or
+        // "F8 taken" outcome through the HotkeyManager's status callback.
+        _hotkeyManager.RegisterMain(_hotkeyVk, _hotkeyModifiers, _hotkeyName);
     }
 
     private void OnScheduleClick(object sender, RoutedEventArgs e)
     {
         // M3: the schedule editor.
-    }
-
-    private void OnProfileNewClick(object sender, RoutedEventArgs e)
-    {
-        // M2b2: ProfileController.New().
-    }
-
-    private void OnProfileRenameClick(object sender, RoutedEventArgs e)
-    {
-        // M2b2: ProfileController.Rename().
-    }
-
-    private void OnProfileDuplicateClick(object sender, RoutedEventArgs e)
-    {
-        // M2b2: ProfileController.Duplicate().
-    }
-
-    private void OnProfileDeleteClick(object sender, RoutedEventArgs e)
-    {
-        // M2b2: ProfileController.Delete().
-    }
-
-    private void OnProfileSaveClick(object sender, RoutedEventArgs e)
-    {
-        // M2b2: ProfileController.SaveCurrentPointsToProfile().
     }
 }
