@@ -906,6 +906,19 @@ public partial class Form1 : Form
     /// <summary>Appends (or, on a double-click chain, replaces) a freshly recorded action.</summary>
     private void AddRecordedAction(SeqAction a, bool replacesLast)
     {
+        // Record-time selector enrichment: a Click also snapshots what UI Automation sees at
+        // its point, so later (opt-in) playback can self-heal if the point drifts. Cheap and
+        // best-effort — a miss just leaves the selector fields empty, and with PreferSelector
+        // still false the action behaves exactly as before. Runs on the UI thread (this event
+        // is marshalled via BeginInvoke), which is where UIA is happiest.
+        if (a.Kind == ActionKind.Click)
+        {
+            UiaInvoker.TryDescribeAt(a.X, a.Y, out string? automationId, out string? name, out string? className);
+            a.SelAutomationId = automationId ?? "";
+            a.SelName = name ?? "";
+            a.SelClass = className ?? "";
+        }
+
         if (replacesLast && points.Count > 0) points[^1] = a;
         else points.Add(a);
         RefreshList();

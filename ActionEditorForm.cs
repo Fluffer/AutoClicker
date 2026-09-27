@@ -38,6 +38,10 @@ internal sealed class ActionEditorForm : Form
     private readonly TextBox txtText = new() { Width = 260, Height = 80, Multiline = true, ScrollBars = ScrollBars.Vertical, AcceptsReturn = true, Margin = new Padding(3, 4, 3, 3) };
     private readonly NumericUpDown numDelay = NewNum(0, int.MaxValue);
 
+    // ---- Self-healing selector (Click only) ----
+    private readonly TextBox txtSelector = new() { ReadOnly = true, Width = 320, Margin = new Padding(3, 4, 3, 3) };
+    private readonly CheckBox chkPreferSelector = new() { Text = "Self-heal: find this control by its selector if the point drifts", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+
     // ---- Pixel condition / WaitPixel ----
     private readonly ComboBox cmbCondition = NewCombo(260);
     private readonly NumericUpDown numCondX = NewNum(-100000, 100000);
@@ -205,6 +209,8 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "Mouse button:", cmbButton, k => k is ActionKind.Click or ActionKind.Drag);
         AddRow(root, "Click type:", cmbClickType, k => k is ActionKind.Click);
         AddRow(root, "Hold button (ms):", numHold, k => k is ActionKind.Click);
+        AddRow(root, "Recorded selector:", txtSelector, k => k == ActionKind.Click);
+        AddRow(root, "", chkPreferSelector, k => k == ActionKind.Click);
         AddRow(root, "Drag to  X", endFlow, k => k is ActionKind.Drag);
         AddRow(root, "Drag duration (ms):", numDragMs, k => k is ActionKind.Drag);
         AddRow(root, "Wheel notches:", numNotches, k => k is ActionKind.Scroll);
@@ -259,6 +265,8 @@ internal sealed class ActionEditorForm : Form
         cmbButton.SelectedIndex = Math.Clamp(action.Button, 0, 2);
         cmbClickType.SelectedIndex = action.DoubleClick ? 1 : 0;
         numHold.Value = action.HoldMs;
+        txtSelector.Text = SelectorSummary(action);
+        chkPreferSelector.Checked = action.PreferSelector;
         numEndX.Value = action.EndX;
         numEndY.Value = action.EndY;
         numDragMs.Value = action.DragMs;
@@ -408,6 +416,16 @@ internal sealed class ActionEditorForm : Form
 
         return "No cursor movement; works on WPF, UWP/WinUI and Chrome. A UIA invoke " +
                "activates the control directly, so button choice, double-click and hold time are ignored.";
+    }
+
+    /// <summary>The recorded self-healing selector as one readable line, or a note that none exists.</summary>
+    private static string SelectorSummary(SeqAction a)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(a.SelAutomationId)) parts.Add("AutomationId=" + a.SelAutomationId);
+        if (!string.IsNullOrEmpty(a.SelName)) parts.Add("Name=" + a.SelName);
+        if (!string.IsNullOrEmpty(a.SelClass)) parts.Add("Class=" + a.SelClass);
+        return parts.Count == 0 ? "(none — record a click to capture one)" : string.Join("   ", parts);
     }
 
     /// <summary>
@@ -819,6 +837,7 @@ internal sealed class ActionEditorForm : Form
         action.Button = cmbButton.SelectedIndex;
         action.DoubleClick = cmbClickType.SelectedIndex == 1;
         action.HoldMs = (int)numHold.Value;
+        action.PreferSelector = chkPreferSelector.Checked;
         action.EndX = (int)numEndX.Value;
         action.EndY = (int)numEndY.Value;
         action.DragMs = (int)numDragMs.Value;

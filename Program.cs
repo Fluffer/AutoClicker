@@ -20,6 +20,16 @@ static class Program
         // so MSIX uninstalls stop deleting the user's profiles and settings.
         UserDataPaths.EnsureMigrated();
 
+        // MCP server mode: an explicit, opt-in CLI surface for AI assistants to drive
+        // AutoClicker. It is deliberately NOT available from the GUI (no arguments) — a
+        // double-clicked app has no reason to expose control of real mouse/keyboard input to
+        // any process that can reach a local pipe, so the server only exists when the user
+        // asks for it from a terminal. Dispatched before normal CLI parsing.
+        if (args.Length > 0 && args[0] == "--mcp")
+        {
+            return McpServer.Run(args[1..]);
+        }
+
         if (args.Length == 0)
         {
             using var mutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool createdNew);

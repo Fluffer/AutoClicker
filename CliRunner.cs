@@ -297,6 +297,7 @@ internal static class CliRunner
               AutoClicker.exe --run <file.acseq> [options]  Run a sequence file
               AutoClicker.exe --profile <name> [options]    Run a saved profile
               AutoClicker.exe --list                        List saved profiles
+              AutoClicker.exe --mcp [--pipe-name <name>]    Start the MCP server (AI assistants)
               AutoClicker.exe --help | -h | -?               Show this help
               AutoClicker.exe --version                      Show version
 

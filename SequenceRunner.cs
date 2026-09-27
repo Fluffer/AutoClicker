@@ -341,6 +341,17 @@ internal sealed class SequenceRunner
         if (a.Kind is ActionKind.FindImage or ActionKind.FindText)
             return ExecuteVisualFind(a, background, jitterPx, humanize, ref lastTarget, ctx);
 
+        // Self-healing playback (opt-in via PreferSelector): a Click that recorded a UIA
+        // selector resolves through it first — the most semantic target available — so a
+        // matched selector still wins when the window moved or the recorded point drifted.
+        // This mirrors SelectorResolver.ChooseResolution's SelectorInvoke outcome; a miss
+        // falls through to the coordinate path below, exactly as it behaved before.
+        if (a.Kind == ActionKind.Click && SelectorResolver.HasSelector(a)
+            && UiaInvoker.TryInvokeSelector(a.SelAutomationId, a.SelName, a.SelClass, out _))
+        {
+            return true;
+        }
+
         bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
         int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
 

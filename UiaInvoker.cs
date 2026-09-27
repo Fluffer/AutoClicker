@@ -29,6 +29,11 @@ internal static class UiaInvoker
     /// <summary>UIA_LegacyIAccessiblePatternId.</summary>
     private const int PatternIdLegacyIAccessible = 10018;
 
+    // Property IDs for the self-healing selector (record-time capture + playback lookup).
+    private const int PropertyIdName = 30005;
+    private const int PropertyIdAutomationId = 30011;
+    private const int PropertyIdClassName = 30012;
+
     // ---- Public API ----
 
     /// <summary>False when UI Automation could not be stood up on the calling thread at all.</summary>
@@ -144,12 +149,158 @@ internal static class UiaInvoker
 #pragma warning restore CA1031
     }
 
+    /// <summary>
+    /// Structured record-time probe: the automation id, name and class name UI Automation
+    /// reports for the element at a screen point. Richer than <see cref="DescribeAt"/>'s
+    /// display string — this is what feeds a recorded Click's self-healing selector fields.
+    /// Returns false (and nulls) when there is nothing usable, on the same never-throw
+    /// contract as <see cref="TryInvokeAt"/>.
+    /// </summary>
+    public static bool TryDescribeAt(int screenX, int screenY,
+        out string? automationId, out string? name, out string? className)
+    {
+        automationId = name = className = null;
+        try
+        {
+            IUIAutomation? automation = TryGetAutomation();
+            if (automation is null) return false;
+
+            IUIAutomationElement? element = ElementAt(automation, screenX, screenY);
+            if (element is null) return false;
+
+            automationId = PropertyString(element, PropertyIdAutomationId);
+            name = PropertyString(element, PropertyIdName);
+            className = PropertyString(element, PropertyIdClassName);
+            return automationId is not null || name is not null || className is not null;
+        }
+#pragma warning disable CA1031 // Diagnostic probe: any COM failure just means "nothing captured".
+        catch (Exception)
+        {
+            return false;
+        }
+#pragma warning restore CA1031
+    }
+
+    /// <summary>
+    /// Finds the element whose automation id / name / class name match the recorded selector
+    /// and invokes it, without moving the cursor. This is the self-healing playback path: when
+    /// a Click's recorded point has drifted (window moved, layout changed) but the control is
+    /// still present under the same selector, the selector finds it and the click still lands.
+    /// </summary>
+    /// <remarks>
+    /// Same never-throw contract as <see cref="TryInvokeAt"/>: COM failures of every shape are
+    /// caught and turned into <c>false</c> plus a <paramref name="failureReason"/>, so a miss
+    /// is a soft fall-through to the coordinate path, never an abort.
+    /// </remarks>
+    public static bool TryInvokeSelector(string? automationId, string? name, string? className,
+        out string failureReason)
+    {
+        failureReason = "";
+        if (string.IsNullOrEmpty(automationId) && string.IsNullOrEmpty(name) && string.IsNullOrEmpty(className))
+        {
+            failureReason = "no selector fields recorded";
+            return false;
+        }
+
+        try
+        {
+            IUIAutomation? automation = TryGetAutomation();
+            if (automation is null)
+            {
+                failureReason = "UI Automation is not available on this machine.";
+                return false;
+            }
+
+            IUIAutomationElement? root = automation.GetRootElement();
+            if (root is null)
+            {
+                failureReason = "UI Automation has no root element.";
+                return false;
+            }
+
+            IUIAutomationCondition? condition = BuildSelectorCondition(automation, automationId, name, className);
+            if (condition is null)
+            {
+                failureReason = "could not build a selector condition";
+                return false;
+            }
+
+            IUIAutomationElement? element = root.FindFirst(TreeScope.Descendants, condition);
+            if (element is null)
+            {
+                failureReason = $"no element matches selector (automationId=\"{automationId}\", " +
+                                $"name=\"{name}\", className=\"{className}\")";
+                return false;
+            }
+
+            if (TryGetPattern(element, PatternIdInvoke, out IUIAutomationInvokePattern? invoke))
+            {
+                invoke!.Invoke();
+                return true;
+            }
+
+            if (TryGetPattern(element, PatternIdLegacyIAccessible, out IUIAutomationLegacyIAccessiblePattern? legacy))
+            {
+                legacy!.DoDefaultAction();
+                return true;
+            }
+
+            failureReason = "matched element exposes no invokable pattern";
+            return false;
+        }
+#pragma warning disable CA1031 // COM providers throw unpredictably; this boundary must never propagate into the engine loop.
+        catch (Exception ex)
+        {
+            failureReason = $"UI Automation selector invoke failed: {ex.Message}";
+            return false;
+        }
+#pragma warning restore CA1031
+    }
+
     // ---- Element / pattern lookup ----
 
     private static IUIAutomationElement? ElementAt(IUIAutomation automation, int screenX, int screenY)
     {
         var pt = new POINT { X = screenX, Y = screenY };
         return automation.ElementFromPoint(pt);
+    }
+
+    /// <summary>Reads a BSTR-typed property as a string, or null when absent/not a string.</summary>
+    private static string? PropertyString(IUIAutomationElement element, int propertyId)
+    {
+        try
+        {
+            return element.GetCurrentPropertyValue(propertyId) as string;
+        }
+        catch (COMException) { return null; }
+        catch (NotImplementedException) { return null; }
+    }
+
+    /// <summary>
+    /// Builds the UIA condition matching every non-empty selector field, ANDed together. A
+    /// missing/empty field is simply skipped, so a Click that only captured a name still
+    /// matches on name alone.
+    /// </summary>
+    private static IUIAutomationCondition? BuildSelectorCondition(IUIAutomation automation,
+        string? automationId, string? name, string? className)
+    {
+        IUIAutomationCondition? result = null;
+
+        (string? value, int propertyId)[] parts =
+        {
+            (automationId, PropertyIdAutomationId),
+            (name, PropertyIdName),
+            (className, PropertyIdClassName),
+        };
+
+        foreach (var (value, propertyId) in parts)
+        {
+            if (string.IsNullOrEmpty(value)) continue;
+            IUIAutomationCondition next = automation.CreatePropertyCondition(propertyId, value);
+            result = result is null ? next : automation.CreateAndCondition(result, next);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -276,8 +427,9 @@ internal static class UiaInvoker
     }
 
     // ---- COM: IUIAutomation ----
-    // Real signatures for CompareElements (slot 1), GetRootElement (slot 3) and
-    // ElementFromPoint (slot 5); slots 2 and 4 are placeholders.
+    // Real signatures for CompareElements (slot 1), GetRootElement (slot 3), ElementFromPoint
+    // (slot 5), CreatePropertyCondition (slot 21) and CreateAndCondition (slot 23); every other
+    // slot up to 23 is a placeholder so the real methods land on their exact vtable offsets.
 
     [ComImport]
     [Guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")]
@@ -298,11 +450,48 @@ internal static class UiaInvoker
         void Stub04_ElementFromHandle();
 
         IUIAutomationElement? ElementFromPoint(POINT pt);
+
+        void Stub06_GetFocusedElement();
+        void Stub07_GetRootElementBuildCache();
+        void Stub08_ElementFromHandleBuildCache();
+        void Stub09_ElementFromPointBuildCache();
+        void Stub10_GetFocusedElementBuildCache();
+        void Stub11_CreateTreeWalker();
+        void Stub12_ControlViewWalker();
+        void Stub13_ContentViewWalker();
+        void Stub14_RawViewWalker();
+        void Stub15_RawViewCondition();
+        void Stub16_ControlViewCondition();
+        void Stub17_ContentViewCondition();
+        void Stub18_CacheRequest();
+        void Stub19_TrueCondition();
+        void Stub20_FalseCondition();
+
+        // value marshals as a VARIANT: a string becomes VT_BSTR, which is exactly what the
+        // AutomationId/Name/ClassName properties expect.
+        IUIAutomationCondition CreatePropertyCondition(int propertyId,
+            [MarshalAs(UnmanagedType.Struct)] object value);
+
+        void Stub22_CreatePropertyConditionEx();
+
+        IUIAutomationCondition CreateAndCondition(IUIAutomationCondition condition1,
+            IUIAutomationCondition condition2);
+    }
+
+    // ---- COM: IUIAutomationCondition ----
+    // Marker interface: it has no methods of its own, it just identifies a condition object.
+
+    [ComImport]
+    [Guid("352ffba8-0973-437c-a61f-7f7d54f8a25a")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IUIAutomationCondition
+    {
     }
 
     // ---- COM: IUIAutomationElement ----
-    // Real signatures for GetCurrentPattern (slot 14), CurrentControlType (slot 19) and
-    // CurrentName (slot 21); every other slot up to and including 21 is a placeholder.
+    // Real signatures for FindFirst (slot 3), GetCurrentPropertyValue (slot 8),
+    // GetCurrentPattern (slot 14), CurrentControlType (slot 19) and CurrentName (slot 21);
+    // every other slot up to and including 21 is a placeholder.
 
     [ComImport]
     [Guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e")]
@@ -311,12 +500,17 @@ internal static class UiaInvoker
     {
         void Stub01_SetFocus();
         void Stub02_GetRuntimeId();
-        void Stub03_FindFirst();
+
+        IUIAutomationElement? FindFirst(TreeScope scope, IUIAutomationCondition? condition);
+
         void Stub04_FindAll();
         void Stub05_FindFirstBuildCache();
         void Stub06_FindAllBuildCache();
         void Stub07_BuildUpdatedCache();
-        void Stub08_GetCurrentPropertyValue();
+
+        [return: MarshalAs(UnmanagedType.Struct)]
+        object GetCurrentPropertyValue(int propertyId);
+
         void Stub09_GetCurrentPropertyValueEx();
         void Stub10_GetCachedPropertyValue();
         void Stub11_GetCachedPropertyValueEx();
@@ -336,6 +530,17 @@ internal static class UiaInvoker
         void Stub20_CurrentLocalizedControlType();
 
         string CurrentName { get; }
+    }
+
+    /// <summary>UIA <c>TreeScope</c> — the part of the element tree <see cref="IUIAutomationElement.FindFirst"/> searches.</summary>
+    private enum TreeScope
+    {
+        Element = 1,
+        Children = 2,
+        Descendants = 4,
+        Parent = 8,
+        Ancestors = 16,
+        Subtree = 7, // Element | Children | Descendants
     }
 
     // ---- COM: IUIAutomationInvokePattern ----

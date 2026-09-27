@@ -100,6 +100,20 @@ public sealed class SeqAction
     public string WindowClass { get; set; } = "";
     public string WindowTitle { get; set; } = "";
 
+    // ---- Self-healing selector (opt-in) ----
+    // Captured at record time by snapshotting what UI Automation sees at the click point.
+    // Playback only uses them when PreferSelector is set (off by default, so existing
+    // sequences keep their exact current behavior). Older builds simply ignore these extra
+    // fields when reading a file — they don't self-heal, but nothing breaks.
+    public string SelAutomationId { get; set; } = "";
+    public string SelName { get; set; } = "";
+    public string SelClass { get; set; } = "";
+    /// <summary>
+    /// Opt-in: resolve this Click through its recorded UIA selector before falling back to
+    /// coordinates. Off by default; enable in the editor or set it when authoring by hand.
+    /// </summary>
+    public bool PreferSelector { get; set; }
+
     // ---- Pixel condition / WaitPixel ----
     /// <summary>
     /// On any action, gates whether it runs at all: <see cref="PixelCondition.None"/> always
@@ -232,6 +246,9 @@ public sealed class SeqAction
         Text ??= "";
         WindowClass ??= "";
         WindowTitle ??= "";
+        SelAutomationId ??= "";
+        SelName ??= "";
+        SelClass ??= "";
         if (!Enum.IsDefined(Condition)) Condition = PixelCondition.None;
         CondX = Math.Clamp(CondX, -100000, 100000);
         CondY = Math.Clamp(CondY, -100000, 100000);
