@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using static AutoClicker.Native;
 
 namespace AutoClicker;
 
@@ -195,7 +197,14 @@ internal static class ExpressionEvaluator
     {
         VarValue left = ParseAnd(t, ref p, vars);
         while (MatchOp(t, ref p, "||"))
-            left = Num(IsTruthy(left) || IsTruthy(ParseAnd(t, ref p, vars)) ? 1 : 0);
+        {
+            // The right operand is parsed BEFORE the boolean combine: the C# || here must not
+            // short-circuit the PARSE, or a falsy-left expression like `0 || foo()` would leave
+            // `foo()` unconsumed and trip the "unexpected token" check. Both sides are always
+            // evaluated; the result is still the ordinary logical OR of their truthiness.
+            VarValue right = ParseAnd(t, ref p, vars);
+            left = Num(IsTruthy(left) || IsTruthy(right) ? 1 : 0);
+        }
         return left;
     }
 
@@ -203,7 +212,12 @@ internal static class ExpressionEvaluator
     {
         VarValue left = ParseNot(t, ref p, vars);
         while (MatchOp(t, ref p, "&&"))
-            left = Num(IsTruthy(left) && IsTruthy(ParseNot(t, ref p, vars)) ? 1 : 0);
+        {
+            // Same rule as ParseOr: parse the right side unconditionally, so `0 && foo()` still
+            // consumes `foo()` and the result stays the logical AND of the two truthinesses.
+            VarValue right = ParseNot(t, ref p, vars);
+            left = Num(IsTruthy(left) && IsTruthy(right) ? 1 : 0);
+        }
         return left;
     }
 
@@ -373,9 +387,57 @@ internal static class ExpressionEvaluator
             case "abs":
                 RequireArgs(name, args, 1);
                 return Num(Math.Abs(ToNumber(args[0])));
+            case "window_exists":
+                RequireArgs(name, args, 1);
+                return Num(WindowExists(RequireString(name, args[0])) ? 1 : 0);
+            case "process_running":
+                RequireArgs(name, args, 1);
+                return Num(ProcessRunning(RequireString(name, args[0])) ? 1 : 0);
             default:
                 throw new ExpressionException($"Unknown variable or function '{name}'.");
         }
+    }
+
+    /// <summary>Requires a string argument; a number argument (e.g. <c>window_exists(5)</c>) is an error.</summary>
+    private static string RequireString(string name, VarValue value)
+    {
+        if (value.IsString) return value.Text;
+        throw new ExpressionException($"{name}() expects a string argument, got '{value.Text}'.");
+    }
+
+    /// <summary>
+    /// True when any top-level visible window has a class name equal to, or a title
+    /// containing, <paramref name="substring"/> (case-insensitive). Evaluated live on every
+    /// call, on the worker thread — both EnumWindows and the title/class reads are thread-safe.
+    /// </summary>
+    private static bool WindowExists(string substring)
+    {
+        if (substring.Length == 0) return false;
+        bool found = false;
+        EnumWindows((hwnd, _) =>
+        {
+            if (!IsWindowVisible(hwnd)) return true;
+            if (string.Equals(ClassNameOf(hwnd), substring, StringComparison.OrdinalIgnoreCase)
+                || TitleOf(hwnd).Contains(substring, StringComparison.OrdinalIgnoreCase))
+            {
+                found = true;
+                return false; // stop enumerating — nothing will beat an exact hit
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    /// <summary>
+    /// True when a process with the given name is running. The name is accepted with or
+    /// without the ".exe" suffix, case-insensitively; an invalid name is simply "not running".
+    /// </summary>
+    private static bool ProcessRunning(string name)
+    {
+        if (name.Length == 0) return false;
+        string stem = name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
+        try { return Process.GetProcessesByName(stem).Length > 0; }
+        catch (ArgumentException) { return false; }
     }
 
     private static void RequireArgs(string name, List<VarValue> args, int count)

@@ -20,7 +20,7 @@ public partial class Form1 : Form
     private Button btnRecord = null!, btnAddCur = null!, btnAddAction = null!, btnEdit = null!, btnRemovePoint = null!, btnClearPoints = null!;
     private Button btnUp = null!, btnDown = null!, btnSave = null!, btnLoad = null!;
     private Button btnStart = null!, btnStop = null!, btnHotkey = null!;
-    private Label lblStatus = null!;
+    private ToolStripStatusLabel lblStatus = null!;
     private TableLayoutPanel root = null!;
     private NumericUpDown numStartDelay = null!;
     private CheckBox chkPanic = null!;
@@ -31,6 +31,18 @@ public partial class Form1 : Form
     private CheckBox chkMinimizeToTray = null!;
     private ComboBox cmbColorMode = null!;
     private Button btnSchedule = null!;
+    private NumericUpDown numSpeed = null!;
+    private CheckBox chkRestoreCursor = null!;
+
+    // ---- Toolbar + status strip (v2.1 chrome) ----
+    private ToolStrip toolStripMain = null!;
+    private ToolStripButton tsRecord = null!, tsPlay = null!, tsStop = null!, tsSave = null!, tsLoad = null!;
+    private ToolStripDropDownButton tsAdd = null!;
+    private ToolStripStatusLabel lblState = null!, lblActionCount = null!, lblWaitTotal = null!, lblRunTimer = null!;
+    private System.Windows.Forms.Timer? runTimer;
+    private readonly System.Diagnostics.Stopwatch runTimerStopwatch = new();
+    private int runStepIndex = -1; // 0-based original index of the step about to run, for the "Running N/M" state label.
+    private Panel emptyOverlay = null!;
 
     // ---- Profiles ----
     private CheckBox chkUseProfiles = null!;
@@ -94,6 +106,11 @@ public partial class Form1 : Form
         InitializeComponent();
 
         ApplySettings();
+        // Seed the list state on first launch: with no saved sequence, RestoreLastSequence
+        // never runs RefreshList, which left the empty-state overlay hidden and the status
+        // strip showing literal designer defaults ("0 actions", "waits Σ 0 ms") until the
+        // first mutation.
+        RefreshList();
         UpdateEnabled();
 
         // Surface the one-time legacy → Documents migration as the session's status line,
@@ -168,6 +185,8 @@ public partial class Form1 : Form
         chkRunLogging.Checked = settings.RunLoggingEnabled;
         chkMinimizeToTray.Checked = settings.MinimizeToTray;
         cmbColorMode.SelectedIndex = settings.ColorMode;
+        numSpeed.Value = settings.SpeedPercent;
+        chkRestoreCursor.Checked = settings.RestoreCursorAfterRun;
 
         RestoreLastSequence();
         RestoreProfiles();
@@ -200,6 +219,8 @@ public partial class Form1 : Form
         settings.CornerFailSafe = chkCornerFailSafe.Checked;
         settings.MaxRunSeconds = (int)numMaxRunSeconds.Value;
         settings.RunLoggingEnabled = chkRunLogging.Checked;
+        settings.SpeedPercent = (int)numSpeed.Value;
+        settings.RestoreCursorAfterRun = chkRestoreCursor.Checked;
         settings.ColorMode = cmbColorMode.SelectedIndex;
         settings.MinimizeToTray = chkMinimizeToTray.Checked;
 
@@ -266,6 +287,10 @@ public partial class Form1 : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         Controls.Add(root);
 
+        // Toolbar and status strip are ROWS of the same root table (not docked siblings),
+        // so the form's AutoSize-based sizing keeps working exactly as before.
+        root.Controls.Add(BuildToolStrip());
+
         root.Controls.Add(BuildIntervalGroup());
         root.Controls.Add(BuildOptionsRepeatRow());
         root.Controls.Add(BuildCursorHumanizeRow());
@@ -278,13 +303,7 @@ public partial class Form1 : Form
         btnHotkey.Click += BtnHotkey_Click;
         root.Controls.Add(btnHotkey);
 
-        lblStatus = new Label
-        {
-            Text = "Ready. Press " + hotkeyName + " to start/stop.",
-            Dock = DockStyle.Fill, Height = 56, Margin = new Padding(3, 6, 3, 3),
-            BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.DimGray
-        };
-        root.Controls.Add(lblStatus);
+        root.Controls.Add(BuildStatusStrip());
 
         UpdateEnabled();
     }
@@ -420,13 +439,76 @@ public partial class Form1 : Form
         t.Controls.Add(chkAnchorPoints, 0, 2);
         t.SetColumnSpan(chkAnchorPoints, 2);
 
-        lvPoints = new ListView { View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, MultiSelect = true, Width = 500, Height = 200, Margin = new Padding(3) };
+        lvPoints = new ListView { View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, MultiSelect = true, Dock = DockStyle.Fill };
         lvPoints.Columns.Add("#", 30);
         lvPoints.Columns.Add("Action", 190);
         lvPoints.Columns.Add("Target", 200);
-        lvPoints.Columns.Add("Wait ms", 70);
+        lvPoints.Columns.Add("Wait ms", 90); // 70 truncates to "Wait…" at 150% DPI
+        lvPoints.Columns.Add("Comment", 140);
         lvPoints.DoubleClick += (_, _) => EditSelectedPoint();
-        t.Controls.Add(lvPoints, 0, 3);
+
+        // Right-click run entry points: both bypass the checkbox state and run a bounded
+        // slice of the current list through the same RunSpec path as the Start button.
+        var lvMenu = new ContextMenuStrip();
+        var miFromHere = new ToolStripMenuItem("Run from here");
+        miFromHere.Click += (_, _) => RunFromHere();
+        var miRunSelection = new ToolStripMenuItem("Run selection");
+        miRunSelection.Click += (_, _) => RunSelection();
+        lvMenu.Items.Add(miFromHere);
+        lvMenu.Items.Add(miRunSelection);
+        lvMenu.Opening += (_, _) =>
+        {
+            bool any = lvPoints.SelectedIndices.Count > 0;
+            miFromHere.Enabled = any;
+            miRunSelection.Enabled = any;
+        };
+        lvPoints.ContextMenuStrip = lvMenu;
+
+        // Host panel reserves room for the full column set (#/Action/Target/Wait ms/
+        // Comment = 650 px) while the empty-state overlay sits below the header. The
+        // overlay never intercepts clicks when the list is non-empty because RefreshList
+        // hides it the moment there is anything to click.
+        var lvHost = new Panel { Size = new Size(655, 200), Margin = new Padding(3) };
+        lvHost.Controls.Add(lvPoints);
+
+        // Not Dock=Fill: the overlay must stay BELOW the list's column header (the
+        // header is part of lvPoints and would be covered by an opaque docked panel),
+        // so its bounds are managed to start at the header's height — see
+        // UpdateEmptyOverlayBounds.
+        emptyOverlay = new Panel { Dock = DockStyle.None, BackColor = lvPoints.BackColor, Visible = false };
+        lvHost.Resize += (_, _) => UpdateEmptyOverlayBounds();
+        var emptyContent = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            Padding = new Padding(16, 24, 16, 16),
+        };
+        emptyContent.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        emptyContent.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        emptyContent.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        emptyContent.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        var emptyMsg = new Label
+        {
+            Text = "No actions yet — press Record, click Add ▾, or load a saved sequence.",
+            AutoSize = true,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Anchor = AnchorStyles.None,
+        };
+        emptyContent.Controls.Add(emptyMsg, 0, 0);
+        var emptyLinks = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Anchor = AnchorStyles.None, Margin = new Padding(0, 6, 0, 0) };
+        var lnkRecord = new LinkLabel { Text = "Record", AutoSize = true, Margin = new Padding(3) };
+        lnkRecord.Click += (_, _) => ToggleRecording();
+        var lnkLoad = new LinkLabel { Text = "Load…", AutoSize = true, Margin = new Padding(3) };
+        lnkLoad.Click += (_, _) => LoadSequence();
+        emptyLinks.Controls.Add(lnkRecord);
+        emptyLinks.Controls.Add(lnkLoad);
+        emptyContent.Controls.Add(emptyLinks, 0, 1);
+        emptyOverlay.Controls.Add(emptyContent);
+        emptyOverlay.Visible = false; // toggled in RefreshList
+        lvHost.Controls.Add(emptyOverlay);
+        emptyOverlay.BringToFront();
+
+        t.Controls.Add(lvHost, 0, 3);
 
         var btns = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(6, 3, 3, 3) };
         btnRecord = SeqBtn("● Record clicks");
@@ -575,6 +657,18 @@ public partial class Form1 : Form
         colorModeFlow.Controls.Add(Lbl("applies on next launch"));
         t.Controls.Add(colorModeFlow, 1, 7);
 
+        t.Controls.Add(Lbl("Playback speed"), 0, 8);
+        var speedFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        numSpeed = NewNum(25, 400, 100);
+        numSpeed.Width = 70;
+        speedFlow.Controls.Add(numSpeed);
+        speedFlow.Controls.Add(Lbl("% of recorded timing (100 = as recorded, 200 = twice as fast)"));
+        t.Controls.Add(speedFlow, 1, 8);
+
+        chkRestoreCursor = new CheckBox { Text = "Restore mouse position when the run ends", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkRestoreCursor, 0, 9);
+        t.SetColumnSpan(chkRestoreCursor, 2);
+
         grp.Controls.Add(t);
         return grp;
     }
@@ -635,8 +729,31 @@ public partial class Form1 : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+
+        // Capture the auto-sized natural size BEFORE touching AutoSize: switching
+        // AutoSize off on a Form re-seeds its client to the design-time default
+        // (300x300 observed at 150% DPI), which then also got frozen into
+        // MinimumSize — the v2.0 sizing regression. Restore the natural size after
+        // unfreezing, then freeze THAT as the minimum.
+        Size natural = Size;
+
+        // OnShown can fire before the AutoSize pass has applied root's preferred size
+        // on some sessions, so make sure layout has run and, if the form is still at
+        // the default, grow it from root's content explicitly.
+        PerformLayout();
+        // Proposed INFINITE size, not Size.Empty: TableLayoutPanel computes percent
+        // columns/rows against the proposal, so an empty proposal can collapse.
+        Size want = root.GetPreferredSize(new Size(int.MaxValue, int.MaxValue));
+        if (want.Width > 0 && want.Height > 0 &&
+            (want.Width + Padding.Horizontal > natural.Width ||
+             want.Height + Padding.Vertical > natural.Height))
+        {
+            natural = new Size(want.Width + Padding.Horizontal, want.Height + Padding.Vertical);
+        }
+
         AutoSize = false;
         root.AutoSize = false;
+        Size = natural;
         MinimumSize = new Size(Width, Height);
     }
 
@@ -709,6 +826,159 @@ public partial class Form1 : Form
     };
     private static Label Lbl(string text) => new() { Text = text, AutoSize = true, Margin = new Padding(3, 7, 3, 3) };
 
+    // ===== Top toolbar (v2.1) =====
+    private ToolStrip BuildToolStrip()
+    {
+        toolStripMain = new ToolStrip
+        {
+            Dock = DockStyle.Fill,
+            GripStyle = ToolStripGripStyle.Hidden,
+            AutoSize = true,
+            Padding = new Padding(4, 2, 4, 2),
+            Margin = new Padding(3, 6, 3, 0),
+        };
+
+        // Record's caption/color mirror btnRecord via StartRecording/StopRecording below.
+        tsRecord = new ToolStripButton("● Record") { ForeColor = Color.DarkRed, DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsRecord.Click += (_, _) => ToggleRecording();
+
+        tsPlay = new ToolStripButton("▶ Play") { ForeColor = Color.DarkGreen, DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsPlay.Click += (_, _) => StartClicking();
+
+        tsStop = new ToolStripButton("■ Stop") { Enabled = false, DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsStop.Click += (_, _) => StopClicking();
+
+        tsAdd = new ToolStripDropDownButton("Add ▾") { DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsAdd.DropDownItems.Add(SubMenu("Mouse", ("Click", ActionKind.Click), ("Drag", ActionKind.Drag), ("Scroll", ActionKind.Scroll)));
+        tsAdd.DropDownItems.Add(SubMenu("Keyboard", ("Key press", ActionKind.Key), ("Type text", ActionKind.Text)));
+        tsAdd.DropDownItems.Add(SubMenu("Timing", ("Wait", ActionKind.Wait), ("Wait for pixel", ActionKind.WaitPixel)));
+        tsAdd.DropDownItems.Add(SubMenu("Visual", ("Find image", ActionKind.FindImage), ("Find text", ActionKind.FindText)));
+        tsAdd.DropDownItems.Add(SubMenu("Flow",
+            ("Repeat (loop)", ActionKind.Repeat),
+            ("If (conditional)", ActionKind.IfElse),
+            ("Set variable", ActionKind.SetVar),
+            ("Label", ActionKind.Label),
+            ("Goto label", ActionKind.GotoLabel),
+            ("Break loop", ActionKind.Break)));
+
+        tsSave = new ToolStripButton("Save…") { DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsSave.Click += (_, _) => SaveSequence();
+        tsLoad = new ToolStripButton("Load…") { DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsLoad.Click += (_, _) => LoadSequence();
+
+        toolStripMain.Items.Add(tsRecord);
+        toolStripMain.Items.Add(tsPlay);
+        toolStripMain.Items.Add(tsStop);
+        toolStripMain.Items.Add(new ToolStripSeparator());
+        toolStripMain.Items.Add(tsAdd);
+        toolStripMain.Items.Add(new ToolStripSeparator());
+        toolStripMain.Items.Add(tsSave);
+        toolStripMain.Items.Add(tsLoad);
+
+        return toolStripMain;
+    }
+
+    /// <summary>A submenu whose leaf items each open the action editor pre-seeded with a kind.</summary>
+    private ToolStripMenuItem SubMenu(string text, params (string Label, ActionKind Kind)[] items)
+    {
+        var mi = new ToolStripMenuItem(text);
+        foreach (var (label, kind) in items)
+        {
+            var child = new ToolStripMenuItem(label);
+            child.Click += (_, _) => AddCustomAction(kind);
+            mi.DropDownItems.Add(child);
+        }
+        return mi;
+    }
+
+    // ===== Bottom status strip (v2.1) =====
+    private StatusStrip BuildStatusStrip()
+    {
+        var strip = new StatusStrip
+        {
+            Dock = DockStyle.Fill,
+            SizingGrip = false,
+            AutoSize = true,
+            Margin = new Padding(3, 6, 3, 3),
+        };
+
+        // The rich message label is the strip's spring (it absorbs all extra width); the
+        // compact info labels after it carry state / count / waits / timer.
+        lblStatus = new ToolStripStatusLabel("Ready. Press " + hotkeyName + " to start/stop.")
+        {
+            Spring = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
+        lblState = new ToolStripStatusLabel("Ready");
+        lblActionCount = new ToolStripStatusLabel("0 actions");
+        lblWaitTotal = new ToolStripStatusLabel("waits Σ 0 ms");
+        lblRunTimer = new ToolStripStatusLabel("");
+
+        strip.Items.Add(lblStatus);
+        strip.Items.Add(Sep());
+        strip.Items.Add(lblState);
+        strip.Items.Add(Sep());
+        strip.Items.Add(lblActionCount);
+        strip.Items.Add(Sep());
+        strip.Items.Add(lblWaitTotal);
+        strip.Items.Add(Sep());
+        strip.Items.Add(lblRunTimer);
+
+        runTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        runTimer.Tick += (_, _) => UpdateRunTimerTick();
+
+        return strip;
+    }
+
+    private static ToolStripStatusLabel Sep() => new(" | ");
+
+    private void UpdateRunTimerTick()
+    {
+        TimeSpan elapsed = runTimerStopwatch.Elapsed;
+        lblRunTimer.Text = string.Create(CultureInfo.InvariantCulture, $"{elapsed.Minutes:00}:{elapsed.Seconds:00}");
+    }
+
+    /// <summary>Compact "Ready / Recording / Running N/M" state label.</summary>
+    private void UpdateStateLabel()
+    {
+        if (recordingController.IsRecording) lblState.Text = "Recording";
+        else if (runController.IsRunning)
+            lblState.Text = runStepIndex >= 0 ? $"Running {runStepIndex + 1}/{points.Count}" : "Running";
+        else lblState.Text = "Ready";
+    }
+
+    // ---- Semantic list tinting + summary formatting ----
+
+    /// <summary>
+    /// Very light pastel for the sequence list's semantic row groups. Color.Empty means "no
+    /// tint" (the caller uses the list's own backcolor). Flow kinds (loops/conditionals/
+    /// jumps) are yellow, visual kinds (FindImage/FindText) green, waits blue.
+    /// </summary>
+    private static Color RowTint(ActionKind kind)
+    {
+        if (SeqAction.IsControlKind(kind)) return Color.LightGoldenrodYellow;
+        if (kind is ActionKind.FindImage or ActionKind.FindText) return Color.Honeydew;
+        if (kind is ActionKind.Wait or ActionKind.WaitPixel) return Color.Azure;
+        return Color.Empty;
+    }
+
+    /// <summary>
+    /// The row backcolor for an action, honoring dark mode: the light pastels would leave
+    /// light text unreadable on a dark ListView, so dark mode skips tinting entirely.
+    /// </summary>
+    private Color RowBackColor(SeqAction a)
+    {
+        if (Application.IsDarkModeEnabled) return lvPoints.BackColor;
+        Color tint = RowTint(a.Kind);
+        return tint == Color.Empty ? lvPoints.BackColor : tint;
+    }
+
+    /// <summary>Compact wait-total formatting: 1200 ms → "1.2s"; matches the spec's "waits Σ 4.2s".</summary>
+    private static string FormatWaitTotal(long ms) =>
+        ms < 1000 ? $"{ms} ms"
+        : ms < 60000 ? string.Create(CultureInfo.InvariantCulture, $"{ms / 1000.0:0.#}s")
+        : string.Create(CultureInfo.InvariantCulture, $"{ms / 60000}m {ms % 60000 / 1000}s");
+
     private void UpdateEnabled()
     {
         bool seq = chkSequence.Checked;
@@ -756,9 +1026,10 @@ public partial class Form1 : Form
         lblStatus.Text = $"Added action #{points.Count}: {a.Describe()} at {a.DescribeTarget()}";
     }
 
-    private void AddCustomAction()
+    private void AddCustomAction(ActionKind? presetKind = null)
     {
         var seed = new SeqAction { DelayMs = IntervalMs(), Button = cmbButton.SelectedIndex };
+        if (presetKind is ActionKind kind) seed.Kind = kind;
         var cur = CursorPos();
         seed.X = cur.X;
         seed.Y = cur.Y;
@@ -816,16 +1087,41 @@ public partial class Form1 : Form
         // Block depth is recomputed after every mutation (add/edit/remove/move/load), so
         // the indent guides always reflect the current structure.
         int[] depth = ControlFlow.BuildDepth(points);
+        long waitTotalMs = 0;
         for (int i = 0; i < points.Count; i++)
         {
             var p = points[i];
+            waitTotalMs += p.DelayMs;
             var item = new ListViewItem((i + 1).ToString(CultureInfo.InvariantCulture));
             item.SubItems.Add(IndentGuide(depth[i]) + p.Describe());
             item.SubItems.Add(p.DescribeTarget());
             item.SubItems.Add(p.DelayMs.ToString(CultureInfo.InvariantCulture));
+            item.SubItems.Add(p.Comment);
+            item.BackColor = RowBackColor(p);
             lvPoints.Items.Add(item);
         }
         lvPoints.EndUpdate();
+
+        // Summary labels + empty-state overlay follow the current list.
+        lblActionCount.Text = $"{points.Count} action{(points.Count == 1 ? "" : "s")}";
+        lblWaitTotal.Text = $"waits Σ {FormatWaitTotal(waitTotalMs)}";
+        emptyOverlay.Visible = points.Count == 0 && !recordingController.IsRecording;
+        UpdateEmptyOverlayBounds();
+    }
+
+    // Positions the empty-state overlay below the ListView's column header so the
+    // header (and thus the Comment column) stays visible in the empty state, matching
+    // the competitors' welcome panels. Header height comes from the SysHeader32 child;
+    // until the handle exists there is nothing to position (the overlay stays hidden).
+    private void UpdateEmptyOverlayBounds()
+    {
+        if (emptyOverlay is null || !lvPoints.IsHandleCreated) return;
+        IntPtr hdr = GetDlgItem(lvPoints.Handle, 0); // ListView's header control
+        int headerH = 0;
+        if (hdr != IntPtr.Zero && GetWindowRect(hdr, out RECT r)) headerH = r.Bottom - r.Top;
+        var client = lvPoints.ClientSize;
+        emptyOverlay.Bounds = new Rectangle(0, headerH,
+            Math.Max(0, client.Width), Math.Max(0, client.Height - headerH));
     }
 
     // ListView subitems can't be indented with ListViewItem.Indent (that shifts only the
@@ -905,6 +1201,9 @@ public partial class Form1 : Form
             recordStartCount = points.Count;
             chkSequence.Checked = true;
             btnRecord.Text = "■ Stop recording";
+            tsRecord.Text = "■ Stop rec";
+            tsRecord.ForeColor = Color.DarkGray;
+            UpdateStateLabel();
             lblStatus.Text = "RECORDING: 0 actions — clicks and keys still reach their apps. Right-click or F8 to finish.";
         }
     }
@@ -914,6 +1213,9 @@ public partial class Form1 : Form
         long elapsed = recordingController.ElapsedMs;
         recordingController.Stop();
         btnRecord.Text = "● Record clicks";
+        tsRecord.Text = "● Record";
+        tsRecord.ForeColor = Color.DarkRed;
+        UpdateStateLabel();
         int recorded = points.Count - recordStartCount;
         lblStatus.Text = $"Recording finished. {recorded} action{(recorded == 1 ? "" : "s")} in {FormatDuration(elapsed)}.";
     }
@@ -1069,6 +1371,10 @@ public partial class Form1 : Form
         // first point one is guaranteed to exist.
         hotkeyManager.ProfilesEnabled = chkUseProfiles is { Checked: true };
         hotkeyManager.RegisterProfiles(profileController.Profiles, hotkeyVk);
+
+        // Position the empty-state overlay once the ListView's header exists — the
+        // constructor's RefreshList ran before any handle did, so bounds were skipped.
+        BeginInvoke((Action)(() => UpdateEmptyOverlayBounds()));
     }
 
     // ---- Profiles ----
@@ -1388,8 +1694,36 @@ public partial class Form1 : Form
     private void StartClicking()
     {
         if (recordingController.IsRecording) return;
+        runController.TryStart(BuildRunSpec(0, -1));
+    }
 
-        bool seq = chkSequence.Checked && points.Count > 0;
+    // Right-click "Run from here": the selected action through the end of the list.
+    private void RunFromHere()
+    {
+        if (recordingController.IsRecording) return;
+        int i = SelectedIndex();
+        if (i < 0) { lblStatus.Text = "Select an action to run from."; return; }
+        runController.TryStart(BuildRunSpec(i, -1));
+    }
+
+    // Right-click "Run selection": the first through last of the selected rows, inclusive.
+    private void RunSelection()
+    {
+        if (recordingController.IsRecording) return;
+        var sel = lvPoints.SelectedIndices.Cast<int>().OrderBy(i => i).ToList();
+        if (sel.Count == 0) { lblStatus.Text = "Select the actions to run."; return; }
+        runController.TryStart(BuildRunSpec(sel[0], sel[^1]));
+    }
+
+    /// <summary>
+    /// Builds the <see cref="RunSpec"/> for a start. The normal Start button uses the full
+    /// range (0, -1); the list context menu passes a bounded range, which forces sequence
+    /// mode regardless of the "Use sequence" checkbox.
+    /// </summary>
+    private RunSpec BuildRunSpec(int startIndex, int endIndex)
+    {
+        bool forceSeq = startIndex > 0 || endIndex >= 0;
+        bool seq = forceSeq || (chkSequence.Checked && points.Count > 0);
         bool limited = rbRepeatN.Checked;
         int limit = (int)numRepeat.Value;
         int jitterPx = (int)numJitterPx.Value;
@@ -1406,7 +1740,17 @@ public partial class Form1 : Form
         {
             bg = chkBackground.Checked;
             acts = points.Select(p => p.Clone()).ToList();
-            runDescription = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
+            if (forceSeq)
+            {
+                // Bounds are 1-based for the status line, matching the list's "#" column.
+                int first = Math.Max(0, startIndex);
+                int last = endIndex < 0 ? acts.Count - 1 : Math.Min(endIndex, acts.Count - 1);
+                runDescription = $"Running actions {first + 1}-{last + 1}... press {hotkeyName} to stop.";
+            }
+            else
+            {
+                runDescription = $"Running {acts.Count} actions{(bg ? " (background)" : "")}... press {hotkeyName} to stop.";
+            }
         }
         else
         {
@@ -1421,7 +1765,7 @@ public partial class Form1 : Form
                                   : $"Clicking... press {hotkeyName} to stop.";
         }
 
-        var spec = new RunSpec
+        return new RunSpec
         {
             UseSequence = seq,
             Actions = acts,
@@ -1444,9 +1788,11 @@ public partial class Form1 : Form
             CornerFailSafe = chkCornerFailSafe.Checked,
             MaxRunSeconds = (int)numMaxRunSeconds.Value,
             RunLoggingEnabled = chkRunLogging.Checked,
+            SpeedPercent = (int)numSpeed.Value,
+            StartIndex = startIndex,
+            EndIndex = endIndex,
+            RestoreCursorAfterRun = chkRestoreCursor.Checked,
         };
-
-        runController.TryStart(spec);
     }
 
     private void StopClicking()
@@ -1456,8 +1802,14 @@ public partial class Form1 : Form
 
     // Fires just before a step is attempted — including one that then blocks for a while (a
     // WaitPixel can sit here for its whole timeout) — so the row is painted amber right away
-    // rather than only once it finishes.
-    private void OnRunnerStepStarting(int index) => Highlight(index);
+    // rather than only once it finishes. Index is the ORIGINAL list position (the runner
+    // reports slice-local indices translated back), so "Running N/M" matches the list.
+    private void OnRunnerStepStarting(int index)
+    {
+        runStepIndex = index;
+        MarshalToUi(UpdateStateLabel);
+        Highlight(index);
+    }
 
     // Fires once a step has been attempted. A false `performed` means a pixel gate suppressed
     // it; recolor that row the skipped grey-blue. index -1 means the run ended: clear everything.
@@ -1477,7 +1829,10 @@ public partial class Form1 : Form
         {
             BeginInvoke(() =>
             {
-                foreach (ListViewItem it in lvPoints.Items) it.BackColor = lvPoints.BackColor;
+                // Reset every row to its semantic tint (not a flat backcolor) so the tinting
+                // survives run highlighting; the active/skipped row is then repainted over it.
+                for (int i = 0; i < lvPoints.Items.Count; i++)
+                    lvPoints.Items[i].BackColor = i < points.Count ? RowBackColor(points[i]) : lvPoints.BackColor;
                 if (index >= 0 && index < lvPoints.Items.Count)
                 {
                     lvPoints.Items[index].BackColor = skipped ? SkippedHighlight : RunningHighlight;
@@ -1489,13 +1844,31 @@ public partial class Form1 : Form
         catch (InvalidOperationException) { }
     }
 
-    // Keeps the tray menu's Start/Stop items in step with the main buttons — this is the only
-    // place either pair is ever set, so they can't drift apart.
+    // Keeps the tray menu's Start/Stop items and the toolbar's Play/Stop in step with the
+    // main buttons — this is the only place either pair is ever set, so they can't drift
+    // apart. Also owns the run timer and the compact state label.
     private void SetRunningButtonsState(bool running)
     {
         btnStart.Enabled = !running;
         btnStop.Enabled = running;
         miStart.Enabled = !running;
         miStop.Enabled = running;
+        tsPlay.Enabled = !running;
+        tsStop.Enabled = running;
+
+        runStepIndex = -1;
+        UpdateStateLabel();
+
+        if (running)
+        {
+            runTimerStopwatch.Restart();
+            lblRunTimer.Text = "00:00";
+            runTimer?.Start();
+        }
+        else
+        {
+            runTimer?.Stop();
+            lblRunTimer.Text = "";
+        }
     }
 }

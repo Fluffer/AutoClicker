@@ -15,6 +15,15 @@ internal sealed class RunOptions
     public int JitterPixels { get; set; }
     public int JitterPercent { get; set; }
 
+    /// <summary>Playback speed as a percentage of recorded timing (100 = as recorded).</summary>
+    public int SpeedPercent { get; set; } = 100;
+
+    /// <summary>First action index to run (0-based); everything before it is skipped.</summary>
+    public int StartIndex { get; set; }
+
+    /// <summary>Last action index to run inclusive, or -1 for "to the end".</summary>
+    public int EndIndex { get; set; } = -1;
+
     /// <summary>Stop the run when the cursor is parked in a screen corner (opt-in fail-safe).</summary>
     public bool CornerFailSafe { get; set; }
 }
@@ -33,6 +42,9 @@ internal sealed class SingleRunOptions
     public int Limit { get; set; } = 1;
     public int JitterPixels { get; set; }
     public int JitterPercent { get; set; }
+
+    /// <summary>Playback speed as a percentage of recorded timing (100 = as recorded).</summary>
+    public int SpeedPercent { get; set; } = 100;
 }
 
 /// <summary>
@@ -96,7 +108,9 @@ internal sealed class SequenceRunner
             InputSender.Click(options.Button, options.DoubleClick);
             count++;
             if (options.Limited && count >= options.Limit) break;
-            InterruptibleSleep(JitterMs(options.IntervalMs, options.JitterPercent));
+            // Speed scales every InterruptibleSleep, including the single-point repeat interval,
+            // so a 2× run also clicks twice as often (jitter is applied first, then speed).
+            InterruptibleSleep(Spd(JitterMs(options.IntervalMs, options.JitterPercent), options.SpeedPercent));
         }
     }
 
@@ -110,11 +124,21 @@ internal sealed class SequenceRunner
             // are posted to the window of the most recent positioned action.
             POINT lastTarget = CursorPos();
 
+            // Run selection is applied ONCE here, by slicing the caller's list before any
+            // block/label map is built. The instruction pointer below then walks `slice`
+            // (indices 0..slice.Count-1) exactly as before, so the whole control-flow
+            // machinery is untouched by the offset. Only the step callbacks translate a
+            // slice-local index back to its original position in `actions` via
+            // `options.StartIndex` — the caller's list (and any per-step logging keyed to
+            // it) stays addressed by original indices.
+            List<SeqAction> slice = Slice(actions, options.StartIndex, options.EndIndex);
+            int indexOffset = options.StartIndex;
+
             // Block/label structure is built once per run: it depends only on the action
             // list, which the caller hands us as a snapshot. Variables are run-scoped too,
             // so a SetVar persists across passes (while built-ins like `pass` are rewritten
             // at the top of every pass).
-            var ctx = new RunContext(actions);
+            var ctx = new RunContext(slice);
 
             while (keepGoing())
             {
@@ -124,10 +148,10 @@ internal sealed class SequenceRunner
                 ctx.Variables["y"] = VarValue.FromNumber(cursor.Y);
 
                 int ip = 0;
-                while (ip < actions.Count && keepGoing())
+                while (ip < slice.Count && keepGoing())
                 {
                     int stepIp = ip;
-                    var a = actions[stepIp];
+                    var a = slice[stepIp];
                     // Corner fail-safe: checked before each foreground mouse action. The
                     // cursor only moves under our control during foreground clicks/drags/
                     // scrolls, so those are the only kinds where a user parking it in a
@@ -135,15 +159,17 @@ internal sealed class SequenceRunner
                     if (options.CornerFailSafe && !options.Background
                         && a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll)
                         CheckCornerFailSafe();
-                    onStepStarting?.Invoke(stepIp);
+                    onStepStarting?.Invoke(stepIp + indexOffset);
                     bool performed = ExecuteStep(a, options, ref lastTarget, ctx, ref ip);
-                    onStep?.Invoke(stepIp, performed);
+                    onStep?.Invoke(stepIp + indexOffset, performed);
                     // DelayMs applies after every action, control-flow included, so a tight
                     // loop still idles at the configured pace instead of spinning the CPU.
-                    InterruptibleSleep(JitterMs(a.DelayMs, options.JitterPercent));
+                    // Per-action ±% (when set) wins over the run's global jitter, and the
+                    // jittered delay is then scaled by the playback speed.
+                    InterruptibleSleep(Spd(EffectiveDelayMs(a, options.JitterPercent), options.SpeedPercent));
                 }
 
-                if (ip >= actions.Count) onPassComplete?.Invoke();
+                if (ip >= slice.Count) onPassComplete?.Invoke();
                 pass++;
                 if (options.Limited && pass >= options.Limit) break;
             }
@@ -281,7 +307,7 @@ internal sealed class SequenceRunner
                 // Humanization is on when the user asked for either kind of jitter; the
                 // glide path itself is randomized independently of the jitter magnitude.
                 bool humanize = options.JitterPixels > 0 || options.JitterPercent > 0;
-                return Execute(a, options.Background, options.JitterPixels, humanize, ref lastTarget, ctx);
+                return Execute(a, options.Background, options.JitterPixels, humanize, options.SpeedPercent, ref lastTarget, ctx);
         }
     }
 
@@ -311,7 +337,7 @@ internal sealed class SequenceRunner
     /// delegating — so this method only ever sees input kinds and the wait kinds (WaitPixel,
     /// FindImage, FindText).
     /// </summary>
-    private bool Execute(SeqAction a, bool background, int jitterPx, bool humanize, ref POINT lastTarget, RunContext ctx)
+    private bool Execute(SeqAction a, bool background, int jitterPx, bool humanize, int speedPercent, ref POINT lastTarget, RunContext ctx)
     {
         // A gate only applies to ordinary actions — the wait kinds are themselves the wait
         // mechanism, so their Condition means "what to wait for" instead (see SeqAction.Condition).
@@ -328,7 +354,7 @@ internal sealed class SequenceRunner
             if (a.Condition == PixelCondition.None) return true; // nothing to wait for
 
             bool ok = PixelSampler.WaitUntil(a.CondX, a.CondY, a.CondColor, a.CondTolerance,
-                a.Condition == PixelCondition.IfMatch, a.PixelTimeoutMs, a.PollIntervalMs, keepGoing);
+                a.Condition == PixelCondition.IfMatch, Spd(a.PixelTimeoutMs, speedPercent), a.PollIntervalMs, keepGoing);
 
             // WaitUntil also returns false when the user stops the run mid-wait; only a real
             // timeout — the run is still going — should be reported as one.
@@ -339,7 +365,7 @@ internal sealed class SequenceRunner
         }
 
         if (a.Kind is ActionKind.FindImage or ActionKind.FindText)
-            return ExecuteVisualFind(a, background, jitterPx, humanize, ref lastTarget, ctx);
+            return ExecuteVisualFind(a, background, jitterPx, humanize, speedPercent, ref lastTarget, ctx);
 
         // Self-healing playback (opt-in via PreferSelector): a Click that recorded a UIA
         // selector resolves through it first — the most semantic target available — so a
@@ -382,14 +408,16 @@ internal sealed class SequenceRunner
         switch (a.Kind)
         {
             case ActionKind.Click:
-                DispatchClick(a, x, y, method, humanize, ctx);
+                DispatchClick(a, x, y, method, humanize, speedPercent, ctx);
                 break;
 
             case ActionKind.Drag:
                 // UI Automation has no drag primitive -- "invoke a control" doesn't generalize to
                 // a gesture -- so method 2 falls back to PostMessage rather than doing nothing.
-                if (method != 0) InputSender.BackgroundDrag(x, y, ex, ey, a.Button, a.DragMs, keepGoing);
-                else InputSender.Drag(x, y, ex, ey, a.Button, a.DragMs, keepGoing, jitterPx);
+                // The travel duration is speed-scaled like every other wait.
+                int dragMs = Spd(a.DragMs, speedPercent);
+                if (method != 0) InputSender.BackgroundDrag(x, y, ex, ey, a.Button, dragMs, keepGoing);
+                else InputSender.Drag(x, y, ex, ey, a.Button, dragMs, keepGoing, jitterPx);
                 break;
 
             case ActionKind.Scroll:
@@ -422,13 +450,16 @@ internal sealed class SequenceRunner
     /// FindText click-on-found goes through the identical backend resolution (real input,
     /// background messages, or UI Automation) as an ordinary click.
     /// </summary>
-    private void DispatchClick(SeqAction a, int x, int y, int method, bool humanize, RunContext ctx)
+    private void DispatchClick(SeqAction a, int x, int y, int method, bool humanize, int speedPercent, RunContext ctx)
     {
         // Sticky SendInput-blocked memory (see RunContext.SendInputBlocked): once a
         // SendInput click has been refused by an elevated foreground window, every later
         // foreground click goes straight to PostMessage. Retrying SendInput per action
         // would just re-block and throw on every single step of the run.
         if (ctx.SendInputBlocked && method == 0) method = 1;
+
+        // Hold length is speed-scaled, so a 2× run also releases the button twice as soon.
+        int holdMs = Spd(a.HoldMs, speedPercent);
 
         if (method == 2)
         {
@@ -443,13 +474,13 @@ internal sealed class SequenceRunner
         }
         // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
         // panic key wait out the whole hold before taking effect.
-        else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+        else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, holdMs, keepGoing);
         else
         {
             MoveCursorTo(x, y, humanize);
             try
             {
-                InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+                InputSender.Click(a.Button, a.DoubleClick, holdMs, keepGoing);
             }
             catch (Win32Exception)
             {
@@ -458,7 +489,7 @@ internal sealed class SequenceRunner
                 // remember it for the rest of the run — the fallback doesn't throw.
                 ctx.SendInputBlocked = true;
                 if (NextBackendOnFailure(0) == 1)
-                    InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+                    InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, holdMs, keepGoing);
             }
         }
     }
@@ -472,13 +503,15 @@ internal sealed class SequenceRunner
     /// <see cref="SeqAction.AbortRunOnTimeout"/> is set, otherwise report not-performed like a
     /// failed gate.
     /// </summary>
-    private bool ExecuteVisualFind(SeqAction a, bool background, int jitterPx, bool humanize, ref POINT lastTarget, RunContext ctx)
+    private bool ExecuteVisualFind(SeqAction a, bool background, int jitterPx, bool humanize, int speedPercent, ref POINT lastTarget, RunContext ctx)
     {
         // Decode the template once, before the wait, so a corrupt PNG fails immediately
         // instead of after the whole timeout has elapsed.
         using Bitmap? template = a.Kind == ActionKind.FindImage ? DecodeTemplate(a.TemplatePng) : null;
 
         Rectangle region = ResolveSearchRegion(a);
+        // The find timeout is speed-scaled like every other wait; 0 (wait forever) stays 0.
+        int timeoutMs = Spd(a.PixelTimeoutMs, speedPercent);
         var sw = Stopwatch.StartNew();
 
         while (keepGoing())
@@ -513,12 +546,12 @@ internal sealed class SequenceRunner
                     int cy = p.Y + a.ClickOffsetY;
                     if (jitterPx > 0) { cx += JitterPx(jitterPx); cy += JitterPx(jitterPx); }
                     lastTarget = new POINT { X = cx, Y = cy };
-                    DispatchClick(a, cx, cy, ResolveClickMethod(a.ClickMethod, background), humanize, ctx);
+                    DispatchClick(a, cx, cy, ResolveClickMethod(a.ClickMethod, background), humanize, speedPercent, ctx);
                 }
                 return true;
             }
 
-            if (a.PixelTimeoutMs > 0 && sw.ElapsedMilliseconds >= a.PixelTimeoutMs)
+            if (timeoutMs > 0 && sw.ElapsedMilliseconds >= timeoutMs)
             {
                 if (a.AbortRunOnTimeout)
                 {
@@ -695,4 +728,52 @@ internal sealed class SequenceRunner
     }
 
     private static int JitterPx(int maxPx) => maxPx <= 0 ? 0 : Random.Shared.Next(-maxPx, maxPx + 1);
+
+    // ---- Playback speed + per-action delay randomization + run selection ----
+
+    /// <summary>
+    /// Scales a duration by the playback speed: <c>ms * 100 / pct</c>. 100% is a no-op,
+    /// 200% halves the wait, 50% doubles it. Zero stays zero (an "indefinite" timeout must
+    /// never turn finite), and negative values pass through untouched.
+    /// </summary>
+    internal static int Spd(int ms, int pct)
+    {
+        if (ms <= 0 || pct <= 0 || pct == 100) return ms;
+        return (int)((long)ms * 100 / pct);
+    }
+
+    /// <summary>
+    /// The delay a <see cref="ActionKind.Wait"/> (or any action's trailing DelayMs) actually
+    /// sleeps, after per-action randomization. Precedence: an action's own
+    /// <see cref="SeqAction.DelayRandomPercent"/> (when &gt; 0) wins over the run's global
+    /// <paramref name="globalJitterPct"/>, so a single action can be humanized differently
+    /// from the rest of the run. Jitter is applied here, BEFORE the speed scaling that the
+    /// sleep site does next.
+    /// </summary>
+    internal static int EffectiveDelayMs(SeqAction a, int globalJitterPct) =>
+        JitterMs(a.DelayMs, DelayJitterPercent(a, globalJitterPct));
+
+    /// <summary>
+    /// The ±% that actually applies to an action's delay: the action's own override when set,
+    /// otherwise the run's global timing jitter. Extracted pure so the precedence is
+    /// unit-testable without depending on the random jitter magnitude.
+    /// </summary>
+    internal static int DelayJitterPercent(SeqAction a, int globalJitterPct) =>
+        a.DelayRandomPercent > 0 ? a.DelayRandomPercent : globalJitterPct;
+
+    /// <summary>
+    /// The inclusive slice <c>actions[start..end]</c> a run is bounded to, with <paramref name="end"/>
+    /// of -1 meaning "to the end". Clamped so out-of-range or inverted bounds yield the empty
+    /// list rather than an exception; indices are 0-based.
+    /// </summary>
+    internal static List<SeqAction> Slice(IReadOnlyList<SeqAction> actions, int start, int end)
+    {
+        if (actions.Count == 0) return new List<SeqAction>();
+        start = Math.Clamp(start, 0, actions.Count - 1);
+        if (end < 0 || end >= actions.Count) end = actions.Count - 1;
+        if (end < start) return new List<SeqAction>();
+        var result = new List<SeqAction>(end - start + 1);
+        for (int i = start; i <= end; i++) result.Add(actions[i]);
+        return result;
+    }
 }

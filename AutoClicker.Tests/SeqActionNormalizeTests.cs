@@ -125,4 +125,27 @@ public class SeqActionNormalizeTests
         nan.Normalize();
         Assert.Equal(0.85, nan.MatchThreshold);
     }
+
+    [Fact]
+    public void Delay_random_percent_and_comment_are_normalized()
+    {
+        var a = new SeqAction { DelayRandomPercent = -5, Comment = null! };
+        a.Normalize();
+        Assert.Equal(0, a.DelayRandomPercent);
+        Assert.Equal("", a.Comment);
+
+        var over = new SeqAction { DelayRandomPercent = 500 };
+        over.Normalize();
+        Assert.Equal(100, over.DelayRandomPercent);
+    }
+
+    [Fact]
+    public void Describe_appends_per_action_jitter_suffix_only_when_set()
+    {
+        var plain = new SeqAction { Kind = ActionKind.Wait, DelayMs = 100 };
+        Assert.DoesNotContain("±", plain.Describe());
+
+        var jittered = new SeqAction { Kind = ActionKind.Wait, DelayMs = 100, DelayRandomPercent = 25 };
+        Assert.EndsWith("(±25%)", jittered.Describe());
+    }
 }

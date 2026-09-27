@@ -37,6 +37,7 @@ internal sealed class ActionEditorForm : Form
     private readonly Label lblComboHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
     private readonly TextBox txtText = new() { Width = 260, Height = 80, Multiline = true, ScrollBars = ScrollBars.Vertical, AcceptsReturn = true, Margin = new Padding(3, 4, 3, 3) };
     private readonly NumericUpDown numDelay = NewNum(0, int.MaxValue);
+    private readonly TextBox txtComment = new() { Width = 260, Height = 40, Multiline = true, ScrollBars = ScrollBars.Vertical, Margin = new Padding(3, 4, 3, 3) };
 
     // ---- Self-healing selector (Click only) ----
     private readonly TextBox txtSelector = new() { ReadOnly = true, Width = 320, Margin = new Padding(3, 4, 3, 3) };
@@ -257,6 +258,7 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "Click offset  X", clickOffsetFlow, k => k is ActionKind.FindImage or ActionKind.FindText);
 
         AddRow(root, "Wait after (ms):", numDelay, _ => true);
+        AddRow(root, "Comment (optional):", txtComment, _ => true);
 
         numX.Value = action.X;
         numY.Value = action.Y;
@@ -275,6 +277,7 @@ internal sealed class ActionEditorForm : Form
         txtCombo.Text = action.KeyCombo;
         txtText.Text = action.Text;
         numDelay.Value = action.DelayMs;
+        txtComment.Text = action.Comment;
 
         cmbCondition.Items.AddRange(ConditionLabels(SelectedKind));
         cmbCondition.SelectedIndex = (int)action.Condition;
@@ -846,6 +849,7 @@ internal sealed class ActionEditorForm : Form
         action.KeyCombo = txtCombo.Text.Trim();
         action.Text = txtText.Text;
         action.DelayMs = (int)numDelay.Value;
+        action.Comment = txtComment.Text;
         action.Condition = (PixelCondition)cmbCondition.SelectedIndex;
         action.CondX = (int)numCondX.Value;
         action.CondY = (int)numCondY.Value;

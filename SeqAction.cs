@@ -225,6 +225,16 @@ public sealed class SeqAction
     public int DelayMs { get; set; }
 
     /// <summary>
+    /// Per-action ±% randomization of <see cref="DelayMs"/> at run time. 0 = use the run's
+    /// global timing jitter instead; anything higher wins over the global value (the runner
+    /// documents this precedence). 0..100.
+    /// </summary>
+    public int DelayRandomPercent { get; set; }
+
+    /// <summary>Free-form note shown in the sequence list's Comment column. Purely cosmetic.</summary>
+    public string Comment { get; set; } = "";
+
+    /// <summary>
     /// Last window this action resolved to, so a fast sequence doesn't EnumWindows on
     /// every single pass. Runtime-only, and always revalidated before use.
     /// </summary>
@@ -238,6 +248,8 @@ public sealed class SeqAction
     {
         Button = Math.Clamp(Button, 0, 2);
         DelayMs = Math.Max(0, DelayMs);
+        DelayRandomPercent = Math.Clamp(DelayRandomPercent, 0, 100);
+        Comment ??= "";
         HoldMs = Math.Max(0, HoldMs);
         ClickMethod = Math.Clamp(ClickMethod, 0, 2);
         DragMs = Math.Max(0, DragMs);
@@ -310,12 +322,18 @@ public sealed class SeqAction
             _ => Kind.ToString(),
         };
 
-        if (IsWaitKind(Kind) || IsControlKind(Kind) || Condition == PixelCondition.None) return baseDesc;
+        if (IsWaitKind(Kind) || IsControlKind(Kind) || Condition == PixelCondition.None)
+        {
+            // The ±% only shows when the action overrides the run's global timing jitter,
+            // so a default (0) sequence stays as quiet as it always was.
+            return DelayRandomPercent > 0 ? $"{baseDesc} (±{DelayRandomPercent}%)" : baseDesc;
+        }
 
         string suffix = Condition == PixelCondition.IfMatch
             ? $"if {DescribeColor()} at {CondX},{CondY}"
             : $"unless {DescribeColor()} at {CondX},{CondY}";
-        return $"{baseDesc} ({suffix})";
+        string gated = $"{baseDesc} ({suffix})";
+        return DelayRandomPercent > 0 ? $"{gated} (±{DelayRandomPercent}%)" : gated;
     }
 
     /// <summary>Target column for the sequence list.</summary>

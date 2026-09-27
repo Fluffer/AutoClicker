@@ -51,6 +51,15 @@ public sealed class AppSettings
     /// <summary>Stop the run after this many seconds. 0 = unlimited.</summary>
     public int MaxRunSeconds { get; set; }
 
+    /// <summary>
+    /// Playback speed as a percentage of recorded timing: 100 = as recorded, 200 = twice as
+    /// fast (waits, holds, drags and find-timeouts all halve). Clamped to 25..400.
+    /// </summary>
+    public int SpeedPercent { get; set; } = 100;
+
+    /// <summary>Move the cursor back to where it was when the run started (normal/stop/watchdog endings only).</summary>
+    public bool RestoreCursorAfterRun { get; set; }
+
     /// <summary>Write a per-step JSONL audit trail for each run (off by default).</summary>
     public bool RunLoggingEnabled { get; set; }
 
@@ -143,6 +152,7 @@ public sealed class AppSettings
         JitterPercent = Math.Clamp(JitterPercent, 0, 100);
         StartDelaySeconds = Math.Clamp(StartDelaySeconds, 0, 300);
         MaxRunSeconds = Math.Max(0, MaxRunSeconds);
+        SpeedPercent = Math.Clamp(SpeedPercent, 25, 400);
         ColorMode = Math.Clamp(ColorMode, 0, 2);
         PickedX = Math.Clamp(PickedX, -100_000, 100_000);
         PickedY = Math.Clamp(PickedY, -100_000, 100_000);

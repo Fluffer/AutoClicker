@@ -1,3 +1,5 @@
+using static AutoClicker.Native;
+
 namespace AutoClicker;
 
 /// <summary>
@@ -31,6 +33,22 @@ public sealed record RunSpec
     public int MaxRunSeconds { get; init; }
     /// <summary>Write a per-step JSONL audit trail for this run.</summary>
     public bool RunLoggingEnabled { get; init; }
+
+    /// <summary>Playback speed as a percentage of recorded timing (100 = as recorded).</summary>
+    public int SpeedPercent { get; init; } = 100;
+
+    /// <summary>First action index to run (0-based) when <see cref="UseSequence"/>; earlier actions are skipped.</summary>
+    public int StartIndex { get; init; }
+
+    /// <summary>Last action index to run inclusive, or -1 for "to the end".</summary>
+    public int EndIndex { get; init; } = -1;
+
+    /// <summary>
+    /// Move the cursor back to where it was when the run started. Restores on normal
+    /// completion, the watchdog and a user Stop — NOT on panic or the corner fail-safe,
+    /// where the user may be actively moving the mouse to escape.
+    /// </summary>
+    public bool RestoreCursorAfterRun { get; init; }
 }
 
 /// <summary>
@@ -69,6 +87,11 @@ internal sealed class RunController : IDisposable
     private RunLogger? runLogger;
     private List<SeqAction>? logActions;
     private int currentPass;
+    // Cursor restore (opt-in): the position captured at Start, whether to restore it, and
+    // whether this run ended on the corner fail-safe (which suppresses the restore).
+    private POINT startCursor;
+    private bool restoreCursor;
+    private bool failSafeStopped;
 
     public RunController(Func<bool> armPanic, Action disarmPanic, Func<string> hotkeyNameProvider,
         Func<string> panicKeyNameProvider, Action<Action> uiMarshal)
@@ -115,6 +138,11 @@ internal sealed class RunController : IDisposable
         watchdogTriggered = false;
         watchdogSeconds = spec.MaxRunSeconds;
         runLoggingEnabled = spec.RunLoggingEnabled;
+        failSafeStopped = false;
+        restoreCursor = spec.RestoreCursorAfterRun;
+        // Captured once, before any worker (or even a start-delay countdown) can move the
+        // cursor — this is "where the user left it", not wherever a delay happened to end.
+        if (restoreCursor) GetCursorPos(out startCursor);
         running = true;
         RunningChanged?.Invoke(true);
 
@@ -135,6 +163,9 @@ internal sealed class RunController : IDisposable
                 Limit = spec.Limit,
                 JitterPixels = spec.JitterPx,
                 JitterPercent = spec.JitterPct,
+                SpeedPercent = spec.SpeedPercent,
+                StartIndex = spec.StartIndex,
+                EndIndex = spec.EndIndex,
                 CornerFailSafe = spec.CornerFailSafe
             };
             worker = new Thread(() => RunSequenceWorker(spec.Actions, options)) { IsBackground = true };
@@ -156,7 +187,8 @@ internal sealed class RunController : IDisposable
                 Limited = spec.Limited && !hold,
                 Limit = spec.Limit,
                 JitterPixels = spec.JitterPx,
-                JitterPercent = spec.JitterPct
+                JitterPercent = spec.JitterPct,
+                SpeedPercent = spec.SpeedPercent
             };
             worker = new Thread(() => RunSingleWorker(options)) { IsBackground = true };
         }
@@ -293,6 +325,7 @@ internal sealed class RunController : IDisposable
         // message verbatim (e.g. "Stopped by corner fail-safe.") rather than with the
         // "Stopped —" error prefix. The status is surfaced by OnStopped (called from
         // Finish), which runs right after this on the same worker thread.
+        failSafeStopped = ex is FailSafeException;
         stopStatus = ex is FailSafeException ? ex.Message : "Stopped — " + ex.Message;
     }
 
@@ -340,11 +373,24 @@ internal sealed class RunController : IDisposable
     private void Finish()
     {
         running = false;
+        RestoreCursorIfNeeded();
         RunFinished?.Invoke();
         uiMarshal(OnStopped);
         // Released last: TryStart must not be able to claim the engine until this worker
         // has finished touching `running`.
         Interlocked.Exchange(ref busy, 0);
+    }
+
+    /// <summary>
+    /// Restores the cursor to where it was when the run started, when the user opted in.
+    /// Deliberately skipped on a panic and on the corner fail-safe: both mean the user is
+    /// reaching for the mouse to stop the run, and yanking it back out from under them is
+    /// worse than leaving it. Best-effort — a failure here is ignored.
+    /// </summary>
+    private void RestoreCursorIfNeeded()
+    {
+        if (!restoreCursor || panicStopped || failSafeStopped) return;
+        SetCursorPos(startCursor.X, startCursor.Y);
     }
 
     private void OnStopped()

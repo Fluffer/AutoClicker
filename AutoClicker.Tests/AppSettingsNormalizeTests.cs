@@ -88,4 +88,19 @@ public class AppSettingsNormalizeTests
         s.Normalize();
         Assert.Equal("F3", s.PanicKeyName);
     }
+
+    [Fact]
+    public void Speed_percent_is_clamped_to_25_400()
+    {
+        var low = new AppSettings { SpeedPercent = 1 };
+        low.Normalize();
+        Assert.Equal(25, low.SpeedPercent);
+
+        var high = new AppSettings { SpeedPercent = 9999 };
+        high.Normalize();
+        Assert.Equal(400, high.SpeedPercent);
+
+        // A freshly constructed settings object defaults to "as recorded".
+        Assert.Equal(100, new AppSettings().SpeedPercent);
+    }
 }
