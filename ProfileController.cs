@@ -287,6 +287,19 @@ internal sealed class ProfileController
         };
     }
 
+    /// <summary>
+    /// Sets (or clears, with empty/whitespace) the active profile's target process for
+    /// per-app auto-switching. The value is stored trimmed; empty means "no auto-switch".
+    /// </summary>
+    public ProfileOpResult SetTargetProcess(string? raw)
+    {
+        if (ActiveProfileIndex < 0 || ActiveProfileIndex >= profiles.Count) return new ProfileOpResult();
+        Profile p = profiles[ActiveProfileIndex];
+        p.TargetProcess = string.IsNullOrWhiteSpace(raw) ? "" : raw.Trim();
+        Save();
+        return new ProfileOpResult();
+    }
+
     // Single gate for every profile write. Refuses to save when the file failed to load,
     // so a parse error can never be promoted into permanent data loss by the next save.
     private void Save()

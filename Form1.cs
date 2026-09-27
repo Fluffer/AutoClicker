@@ -50,6 +50,12 @@ public partial class Form1 : Form
     private CheckBox chkUseProfiles = null!;
     private ComboBox cmbProfile = null!, cmbProfileHotkey = null!;
     private Button btnProfileNew = null!, btnProfileRename = null!, btnProfileDuplicate = null!, btnProfileDelete = null!, btnProfileSave = null!;
+    // Per-app auto-switch (F8): a target-process textbox bound to the active profile, the
+    // global opt-out checkbox, and the 1.5 s foreground-window poller that performs switches.
+    private TextBox txtTargetProcess = null!;
+    private CheckBox chkAutoSwitch = null!;
+    private System.Windows.Forms.Timer? autoSwitchTimer;
+    private ToolTip profileToolTip = null!;
 
     // ---- Tray icon ----
     private NotifyIcon trayIcon = null!;
@@ -70,6 +76,10 @@ public partial class Form1 : Form
     private int pickCountdown;
     private Action? pickDone;
     private AppSettings settings = null!;
+    // Collapsible sections (F6): the wrappers that own the ▼/► toggles. Sequence is NOT
+    // in this list — it stays always expanded (it is the core of the app). Sections are
+    // applied from settings in ApplySettings and serialized back in CaptureSettingsFromControls.
+    private readonly List<CollapsibleSection> sections = new();
     // Guards programmatic ComboBox/CheckBox updates (restoring settings, refreshing the
     // profile list after New/Rename/Duplicate/Delete) from re-entering the same handlers
     // that respond to the user's own selections.
@@ -82,6 +92,8 @@ public partial class Form1 : Form
     private readonly ProfileController profileController;
     private readonly RunController runController;
     private ScheduleWatcher? scheduleWatcher;
+    // The single modeless Find & Replace dialog (F7). One instance only; Ctrl+F refocuses it.
+    private FindReplaceForm? findReplaceForm;
 
     public Form1()
     {
@@ -194,12 +206,24 @@ public partial class Form1 : Form
         chkStopOnMouseMove.Checked = settings.StopOnUserMouseMove;
         chkRunLogging.Checked = settings.RunLoggingEnabled;
         chkMinimizeToTray.Checked = settings.MinimizeToTray;
+        chkAutoSwitch.Checked = settings.ProfileAutoSwitch;
         cmbColorMode.SelectedIndex = settings.ColorMode;
         numSpeed.Value = settings.SpeedPercent;
         chkRestoreCursor.Checked = settings.RestoreCursorAfterRun;
 
         RestoreLastSequence();
         RestoreProfiles();
+        ApplyCollapsedSections();
+    }
+
+    // Collapses the sections named in settings.CollapsedSections. Runs after BuildUi but
+    // before OnShown's natural-size freeze, so a form restored with sections collapsed
+    // opens at its compact size rather than flashing the full layout first.
+    private void ApplyCollapsedSections()
+    {
+        HashSet<string> collapsed = CollapsedSections.Parse(settings.CollapsedSections);
+        foreach (CollapsibleSection section in sections)
+            if (collapsed.Contains(section.Key)) section.SetExpanded(false);
     }
 
     private void CaptureSettingsFromControls()
@@ -238,12 +262,17 @@ public partial class Form1 : Form
         settings.MinimizeToTray = chkMinimizeToTray.Checked;
 
         settings.UseProfiles = chkUseProfiles.Checked;
+        settings.ProfileAutoSwitch = chkAutoSwitch.Checked;
+        settings.CollapsedSections = CollapsedSections.Serialize(
+            sections.Where(s => !s.Expanded).Select(s => s.Key));
         // ActiveProfileName is kept in sync as profiles are switched, created, renamed or
         // deleted; re-assert it here too and persist whatever is currently on screen, so
         // closing the app while mid-edit on a profile never silently discards that edit.
         if (chkUseProfiles.Checked && profileController.ActiveProfileIndex >= 0 && profileController.ActiveProfileIndex < profileController.Profiles.Count)
         {
             settings.ActiveProfileName = profileController.Profiles[profileController.ActiveProfileIndex].Name;
+            // The target-process box saves on Validated, but closing mid-edit must not lose it.
+            profileController.SetTargetProcess(txtTargetProcess.Text);
             profileController.SaveCurrentPointsToProfile(profileController.ActiveProfileIndex, points);
         }
     }
@@ -295,6 +324,9 @@ public partial class Form1 : Form
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
         Font = new Font("Segoe UI", 9F);
         Padding = new Padding(10);
+        // Ctrl+F must work no matter which child control has focus.
+        KeyPreview = true;
+        KeyDown += Form1_KeyDown;
 
         root = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, GrowStyle = TableLayoutPanelGrowStyle.AddRows };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -304,12 +336,34 @@ public partial class Form1 : Form
         // so the form's AutoSize-based sizing keeps working exactly as before.
         root.Controls.Add(BuildToolStrip());
 
-        root.Controls.Add(BuildIntervalGroup());
-        root.Controls.Add(BuildOptionsRepeatRow());
-        root.Controls.Add(BuildCursorHumanizeRow());
+        // Middle sections are collapsible (F6). Each build method still returns exactly
+        // what it always did; we only wrap the returned control so the toggle glyph can
+        // hide the section's body and let the AutoSize rows re-measure. Sequence is
+        // deliberately left out — it is always expanded.
+        GroupBox intervalGrp = BuildIntervalGroup();
+        root.Controls.Add(intervalGrp);
+        sections.Add(new CollapsibleSection("interval", intervalGrp, intervalGrp.Controls[0]));
+
+        TableLayoutPanel repeatRow = BuildOptionsRepeatRow();
+        root.Controls.Add(repeatRow);
+        sections.Add(new CollapsibleSection("repeat", repeatRow.Controls[0],
+            repeatRow.Controls[0].Controls[0], repeatRow.Controls[1].Controls[0]));
+
+        TableLayoutPanel cursorRow = BuildCursorHumanizeRow();
+        root.Controls.Add(cursorRow);
+        sections.Add(new CollapsibleSection("cursor", cursorRow.Controls[0],
+            cursorRow.Controls[0].Controls[0], cursorRow.Controls[1].Controls[0]));
+
         root.Controls.Add(BuildSequenceGroup());
-        root.Controls.Add(BuildProfilesGroup());
-        root.Controls.Add(BuildRunOptionsGroup());
+
+        GroupBox profilesGrp = BuildProfilesGroup();
+        root.Controls.Add(profilesGrp);
+        sections.Add(new CollapsibleSection("profiles", profilesGrp, profilesGrp.Controls[0]));
+
+        GroupBox runOptionsGrp = BuildRunOptionsGroup();
+        root.Controls.Add(runOptionsGrp);
+        sections.Add(new CollapsibleSection("runoptions", runOptionsGrp, runOptionsGrp.Controls[0]));
+
         root.Controls.Add(BuildButtonsRow());
 
         btnHotkey = new Button { Text = "Hotkey setting", Dock = DockStyle.Fill, Height = 36, Margin = new Padding(3, 6, 3, 3) };
@@ -469,10 +523,14 @@ public partial class Form1 : Form
         miRunSelection.Click += (_, _) => RunSelection();
         var miInsertBreakpoint = new ToolStripMenuItem("Insert breakpoint");
         miInsertBreakpoint.Click += (_, _) => InsertBreakpoint();
+        var miFind = new ToolStripMenuItem("Find…");
+        miFind.Click += (_, _) => ShowFindReplace();
         lvMenu.Items.Add(miFromHere);
         lvMenu.Items.Add(miRunSelection);
         lvMenu.Items.Add(new ToolStripSeparator());
         lvMenu.Items.Add(miInsertBreakpoint);
+        lvMenu.Items.Add(new ToolStripSeparator());
+        lvMenu.Items.Add(miFind);
         lvMenu.Opening += (_, _) =>
         {
             bool any = lvPoints.SelectedIndices.Count > 0;
@@ -616,7 +674,27 @@ public partial class Form1 : Form
         for (int i = 1; i <= 12; i++) cmbProfileHotkey.Items.Add("F" + i);
         cmbProfileHotkey.SelectedIndexChanged += CmbProfileHotkey_SelectedIndexChanged;
         hkRow.Controls.Add(cmbProfileHotkey);
+
+        hkRow.Controls.Add(Lbl("Target app:"));
+        txtTargetProcess = new TextBox { Width = 120, Margin = new Padding(3, 4, 3, 3) };
+        txtTargetProcess.Validated += (_, _) => SaveTargetProcess();
+        hkRow.Controls.Add(txtTargetProcess);
         t.Controls.Add(hkRow);
+
+        chkAutoSwitch = new CheckBox { Text = "Auto-switch by target app", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        chkAutoSwitch.CheckedChanged += (_, _) =>
+        {
+            settings.ProfileAutoSwitch = chkAutoSwitch.Checked;
+            UpdateAutoSwitchTimer();
+        };
+        t.Controls.Add(chkAutoSwitch);
+
+        profileToolTip = new ToolTip();
+        profileToolTip.SetToolTip(txtTargetProcess, "Process name for auto-switch, e.g. notepad (optional)");
+
+        // The per-app auto-switch poller: only ever armed while it can actually switch.
+        autoSwitchTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+        autoSwitchTimer.Tick += (_, _) => AutoSwitchTick();
 
         grp.Controls.Add(t);
         return grp;
@@ -1197,6 +1275,14 @@ public partial class Form1 : Form
     {
         int i = SelectedIndex();
         if (i < 0) { lblStatus.Text = "Select an action first, then Edit."; return; }
+        EditPointAt(i);
+    }
+
+    // Opens the action editor for a specific row. Shared with the Find & Replace dialog,
+    // which may open the editor on a row it has selected rather than the user's selection.
+    private void EditPointAt(int i)
+    {
+        if (i < 0 || i >= points.Count) return;
 
         using var dlg = new ActionEditorForm(points[i], $"Edit action #{i + 1}", points);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
@@ -1204,6 +1290,46 @@ public partial class Form1 : Form
         points[i] = dlg.Result;
         RefreshList();
         lvPoints.Items[i].Selected = true;
+    }
+
+    // ---- Find & Replace (F7) ----
+    private void Form1_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Control && e.KeyCode == Keys.F)
+        {
+            e.SuppressKeyPress = true;
+            ShowFindReplace();
+        }
+    }
+
+    private void ShowFindReplace()
+    {
+        if (findReplaceForm is { IsDisposed: false })
+        {
+            findReplaceForm.Activate();
+            findReplaceForm.FocusFindBox();
+            return;
+        }
+
+        findReplaceForm = new FindReplaceForm(
+            () => points,
+            SelectedIndex,
+            SelectRow,
+            EditPointAt,
+            () => runController.IsBusy || runController.IsRunning || recordingController.IsRecording,
+            RefreshList,
+            ReportStatus);
+        findReplaceForm.FormClosed += (_, _) => findReplaceForm = null;
+        findReplaceForm.Show(this);
+    }
+
+    // Selects and scrolls to a row, for the Find dialog to land on a match.
+    private void SelectRow(int index)
+    {
+        if (index < 0 || index >= lvPoints.Items.Count) return;
+        lvPoints.Items[index].Selected = true;
+        lvPoints.Items[index].Focused = true;
+        lvPoints.Items[index].EnsureVisible();
     }
 
     // ---- Save / Load sequence (JSON) ----
@@ -1270,6 +1396,8 @@ public partial class Form1 : Form
             UpdateStateLabel();
             lblStatus.Text = "RECORDING: 0 actions — clicks and keys still reach their apps. Right-click or F8 to finish.";
         }
+
+        UpdateAutoSwitchTimer();
     }
 
     private void StopRecording()
@@ -1282,6 +1410,7 @@ public partial class Form1 : Form
         UpdateStateLabel();
         int recorded = points.Count - recordStartCount;
         lblStatus.Text = $"Recording finished. {recorded} action{(recorded == 1 ? "" : "s")} in {FormatDuration(elapsed)}.";
+        UpdateAutoSwitchTimer();
     }
 
     /// <summary>Appends (or, on a double-click chain, replaces) a freshly recorded action.</summary>
@@ -1509,7 +1638,9 @@ public partial class Form1 : Form
         }
 
         UpdateProfileHotkeyCombo();
+        UpdateProfileTargetProcess();
         UpdateProfileControlsEnabled();
+        UpdateAutoSwitchTimer();
     }
 
     // Repopulates the combo box from the profile list, optionally re-selecting a profile by
@@ -1557,7 +1688,9 @@ public partial class Form1 : Form
         }
         if (result.ReloadAdHocSequence) RestoreLastSequence();
         UpdateProfileHotkeyCombo();
+        UpdateProfileTargetProcess();
         UpdateProfileControlsEnabled();
+        UpdateAutoSwitchTimer();
     }
 
     private void CmbProfile_SelectedIndexChanged(object? sender, EventArgs e)
@@ -1660,6 +1793,82 @@ public partial class Form1 : Form
         if (result.Status is not null) lblStatus.Text = result.Status;
     }
 
+    // Sets the target-process box to the active profile's value. Programmatic, so it never
+    // fires Validated (and therefore never re-saves) on its own.
+    private void UpdateProfileTargetProcess()
+    {
+        if (profileController.ActiveProfileIndex < 0 || profileController.ActiveProfileIndex >= profileController.Profiles.Count)
+        {
+            txtTargetProcess.Text = "";
+            return;
+        }
+        txtTargetProcess.Text = profileController.Profiles[profileController.ActiveProfileIndex].TargetProcess;
+    }
+
+    // Validated handler: persist the typed target process to the active profile.
+    private void SaveTargetProcess()
+    {
+        int index = profileController.ActiveProfileIndex;
+        if (index < 0 || index >= profileController.Profiles.Count) return;
+        profileController.SetTargetProcess(txtTargetProcess.Text);
+        UpdateAutoSwitchTimer();
+    }
+
+    // Arms the 1.5 s auto-switch poller only while it can actually do something: profiles
+    // on, the global opt-out off, at least one profile has a target, and nothing running or
+    // recording. Called from every place that can change any of those conditions.
+    private bool AutoSwitchEnabled =>
+        chkUseProfiles.Checked
+        && settings.ProfileAutoSwitch
+        && !runController.IsRunning
+        && !recordingController.IsRecording
+        && profileController.Profiles.Any(p => !string.IsNullOrWhiteSpace(p.TargetProcess));
+
+    private void UpdateAutoSwitchTimer()
+    {
+        if (AutoSwitchEnabled) autoSwitchTimer?.Start();
+        else autoSwitchTimer?.Stop();
+    }
+
+    // Tick handler: resolve the foreground window's process and, if it matches a profile's
+    // target other than the one already active, switch to that profile.
+    private void AutoSwitchTick()
+    {
+        if (runController.IsRunning || recordingController.IsRecording) return;
+        if (!chkUseProfiles.Checked || !settings.ProfileAutoSwitch) { autoSwitchTimer?.Stop(); return; }
+
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero) return;
+        uint tid = GetWindowThreadProcessId(hwnd, out uint pid);
+        if (tid == 0 || pid == 0) return;
+
+        string fgName;
+        try { fgName = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return; }
+        if (string.IsNullOrEmpty(fgName)) return;
+
+        int idx = ProfileAutoSwitcher.ChooseTarget(
+            profileController.Profiles.Select(p => p.TargetProcess).ToList(), fgName);
+        if (idx < 0 || idx == profileController.ActiveProfileIndex) return;
+
+        // Hysteresis: if the foreground process already matches the CURRENT profile's target,
+        // we're where we should be — don't bounce to another profile sharing the same target.
+        if (profileController.ActiveProfileIndex >= 0 && profileController.ActiveProfileIndex < profileController.Profiles.Count)
+        {
+            string current = profileController.Profiles[profileController.ActiveProfileIndex].TargetProcess;
+            if (!string.IsNullOrEmpty(current) &&
+                string.Equals(ProfileAutoSwitcher.NormalizeProcessName(current),
+                    ProfileAutoSwitcher.NormalizeProcessName(fgName), StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        SwitchToProfile(idx);
+        suppressProfileEvents = true;
+        try { cmbProfile.SelectedIndex = idx; }
+        finally { suppressProfileEvents = false; }
+        lblStatus.Text = $"Auto-switched to profile \"{profileController.Profiles[idx].Name}\" (target detected).";
+    }
+
     private void OnUseProfilesChanged()
     {
         settings.UseProfiles = chkUseProfiles.Checked;
@@ -1677,6 +1886,8 @@ public partial class Form1 : Form
         btnProfileDelete.Enabled = hasSelection;
         btnProfileSave.Enabled = hasSelection;
         cmbProfileHotkey.Enabled = hasSelection;
+        txtTargetProcess.Enabled = hasSelection;
+        chkAutoSwitch.Enabled = on;
     }
 
     // Minimal modal text-entry dialog, styled like the hotkey-setting dialog above: this
@@ -1743,6 +1954,14 @@ public partial class Form1 : Form
         pickTimer?.Dispose();
         pickTimer = null;
         pickDone = null;
+
+        autoSwitchTimer?.Stop();
+        autoSwitchTimer?.Dispose();
+        autoSwitchTimer = null;
+        profileToolTip?.Dispose();
+        // Owned modeless form: closing the owner closes it too, but close it explicitly so
+        // its FormClosed handler runs while the form is still alive.
+        findReplaceForm?.Close();
 
         // Must run before Join below: if a start-delay countdown is pending, `worker` holds
         // a Thread that was built but never started, and Thread.Join throws on one of those.
@@ -1978,6 +2197,8 @@ public partial class Form1 : Form
             runTimer?.Stop();
             lblRunTimer.Text = "";
         }
+
+        UpdateAutoSwitchTimer();
     }
 
     private void TogglePause()

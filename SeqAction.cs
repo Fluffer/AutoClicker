@@ -362,6 +362,15 @@ public sealed class SeqAction
         !string.IsNullOrEmpty(WindowTitle) ? WindowTitle :
         !string.IsNullOrEmpty(WindowClass) ? WindowClass : "(unknown window)";
 
+    /// <summary>
+    /// One concatenated blob of everything a user could meaningfully search for in this
+    /// action: the list's Action and Target columns, plus the key combo, typed text and
+    /// comment. Kept here (rather than in the form) so Find &amp; Replace can search a plain
+    /// string and the contents are unit-testable.
+    /// </summary>
+    public string SearchableText() =>
+        Describe() + "\n" + DescribeTarget() + "\n" + KeyCombo + "\n" + Text + "\n" + Comment;
+
     /// <summary>True for the kinds that structure flow instead of performing input.</summary>
     internal static bool IsControlKind(ActionKind kind) => kind is
         ActionKind.Repeat or ActionKind.EndBlock or ActionKind.IfElse or ActionKind.SetVar

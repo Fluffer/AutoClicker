@@ -18,6 +18,13 @@ public sealed class Profile
     public string HotkeyName { get; set; } = "";
     public List<SeqAction> Actions { get; set; } = new();
 
+    /// <summary>
+    /// Process name (without ".exe", case-insensitive) whose foreground presence
+    /// auto-switches to this profile. "" = no auto-switch. Additive field: older profiles.json
+    /// files simply lack it and deserialize to "".
+    /// </summary>
+    public string TargetProcess { get; set; } = "";
+
     private const uint MinFunctionKeyVk = 0x70; // F1
     private const uint MaxFunctionKeyVk = 0x7B; // F12
     private const int MaxNameLength = 60;
@@ -42,6 +49,8 @@ public sealed class Profile
         // Always recompute from the VK rather than trusting the stored name, so a
         // hand-edited file can't show "F3" for a key that's actually F7.
         HotkeyName = HotkeyVk == 0 ? "" : FunctionKeyName(HotkeyVk);
+
+        TargetProcess = (TargetProcess ?? "").Trim();
     }
 
     private static string FunctionKeyName(uint vk) =>

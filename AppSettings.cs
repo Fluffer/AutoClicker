@@ -90,6 +90,18 @@ public sealed class AppSettings
     /// <summary>False keeps today's single-sequence behavior; true switches to named profiles.</summary>
     public bool UseProfiles { get; set; }
 
+    /// <summary>
+    /// Global opt-out for per-app profile auto-switching (backlog #8). True by default; a
+    /// profile only participates when its own <see cref="Profile.TargetProcess"/> is set.
+    /// </summary>
+    public bool ProfileAutoSwitch { get; set; } = true;
+
+    /// <summary>
+    /// Semicolon-separated keys of the form's collapsed sections (see
+    /// <see cref="CollapsedSections"/>). "" means everything expanded.
+    /// </summary>
+    public string CollapsedSections { get; set; } = "";
+
     private const uint MinFunctionKeyVk = 0x70; // F1
     private const uint MaxFunctionKeyVk = 0x7B; // F12
     private const uint DefaultHotkeyVk = 0x75; // F6
@@ -176,6 +188,7 @@ public sealed class AppSettings
         PanicKeyName ??= "";
         LastSequencePath ??= "";
         ActiveProfileName ??= "";
+        CollapsedSections ??= "";
 
         // Hotkey modifiers: only the four Win32 MOD_* bits mean anything; anything else in a
         // hand-edited file is discarded.
