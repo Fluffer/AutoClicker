@@ -867,6 +867,28 @@ public partial class Form1 : Form
         MinimumSize = new Size(Width, Height);
     }
 
+    /// <summary>
+    /// Re-fits the window to its natural content size after a layout change (used by
+    /// CollapsibleSection when a section collapses/expands). No-op before the OnShown
+    /// freeze (the normal AutoSize pass owns sizing then) and while maximized/minimized.
+    /// Toggling a section re-fits to content, so a manual resize is overridden by the
+    /// next toggle — the predictable trade for collapse actually shrinking the window.
+    /// </summary>
+    internal void ReflowNaturalSize()
+    {
+        if (AutoSize) return;
+        if (WindowState != FormWindowState.Normal) return;
+
+        Size want = root.GetPreferredSize(new Size(int.MaxValue, int.MaxValue));
+        want = new Size(want.Width + Padding.Horizontal, want.Height + Padding.Vertical);
+        if (want.Width <= 0 || want.Height <= 0) return;
+
+        // MinimumSize first: the frozen minimum from OnShown may be LARGER than the
+        // collapsed content and would otherwise clamp the shrink below.
+        MinimumSize = want;
+        Size = want;
+    }
+
     // Minimizing normally just minimizes to the taskbar; only route to the tray when the
     // user has opted in via chkMinimizeToTray. Guarded with `is { }` rather than a plain
     // null-check because AutoSize layout can fire Resize events while BuildUi is still

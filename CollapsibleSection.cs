@@ -94,14 +94,30 @@ internal sealed class CollapsibleSection
 
     private void Relayout()
     {
-        // Force the AutoSize rows (and the form) to re-measure now that the body is hidden.
+        // Force the AutoSize rows to re-measure now that the body is hidden…
         if (headerHost.Parent is TableLayoutPanel tlp) tlp.PerformLayout();
-        if (headerHost.TopLevelControl is Form f) f.PerformLayout();
+        if (headerHost.TopLevelControl is not Form f) return;
+        f.PerformLayout();
+
+        // …and re-fit the window itself: OnShown froze AutoSize (see that method), so
+        // the form no longer follows the table on its own — without this, collapsing a
+        // section left a large empty shell at the old frozen size. Form1 owns the
+        // natural-size math (shared with OnShown); it no-ops until the freeze and when
+        // the window is maximized/minimized.
+        if (f is Form1 form1) form1.ReflowNaturalSize();
     }
 
     private void PositionGlyph()
     {
         Size pref = glyph.PreferredSize;
-        glyph.Location = new Point(Math.Max(0, headerHost.ClientSize.Width - pref.Width - 4), 0);
+        // Anchor the glyph right after the HEADER TITLE, never to the live right edge:
+        // pinning to ClientSize.Width inside an AutoSize/Dock=Fill GroupBox feeds the
+        // glyph's own position back into the header's preferred width (+4 px per cycle),
+        // which inflated every section to full form width (the +720 px regression) and
+        // pushed full-row glyphs past the window edge where they were unclickable.
+        int titleEnd = 8;
+        if (headerHost is GroupBox gb && gb.Text.Length > 0)
+            titleEnd = 8 + TextRenderer.MeasureText(gb.Text, gb.Font).Width + 8;
+        glyph.Location = new Point(Math.Max(0, Math.Min(titleEnd, Math.Max(0, headerHost.ClientSize.Width - pref.Width))), 0);
     }
 }
