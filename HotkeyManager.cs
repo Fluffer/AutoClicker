@@ -29,15 +29,18 @@ internal sealed class HotkeyManager
     private const int HOTKEY_TOGGLE = 0xB001;
     private const int HOTKEY_RECEND = 0xB002;
     private const int HOTKEY_PANIC = 0xB003;
+    private const int HOTKEY_PAUSE = 0xB004;
     // Per-profile hotkey ids start well clear of the three fixed ids above so a profile
     // can never collide with the toggle/end-recording/panic hotkeys by id.
     private const int ProfileHotkeyIdBase = 0xB010;
+    private const uint VK_F7 = 0x76;
     private const uint VK_F8 = 0x77;
 
     private readonly Func<IntPtr> hwndProvider;
     private readonly Action<string> reportStatus;
 
     private bool panicRegistered;
+    private bool pauseRegistered;
     private int profileCount;
     private readonly List<int> registeredProfileHotkeyIds = new();
 
@@ -62,6 +65,9 @@ internal sealed class HotkeyManager
     /// <summary>Raised on the UI thread when the armed panic hotkey is pressed.</summary>
     public event Action? PanicPressed;
 
+    /// <summary>Raised on the UI thread when the armed F7 pause/step hotkey is pressed.</summary>
+    public event Action? PausePressed;
+
     /// <summary>Raised on the UI thread when a profile hotkey is pressed, with its profile index.</summary>
     public event Action<int>? ProfileHotkeyPressed;
 
@@ -71,6 +77,7 @@ internal sealed class HotkeyManager
         if (id == HOTKEY_TOGGLE) { TogglePressed?.Invoke(); return true; }
         if (id == HOTKEY_RECEND) { EndRecordingPressed?.Invoke(); return true; }
         if (id == HOTKEY_PANIC) { PanicPressed?.Invoke(); return true; }
+        if (id == HOTKEY_PAUSE) { PausePressed?.Invoke(); return true; }
         if (id >= ProfileHotkeyIdBase && id < ProfileHotkeyIdBase + profileCount)
         {
             ProfileHotkeyPressed?.Invoke(id - ProfileHotkeyIdBase);
@@ -104,6 +111,7 @@ internal sealed class HotkeyManager
         UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
         UnregisterHotKey(hwnd, HOTKEY_RECEND);
         UnregisterPanic();
+        UnregisterPause();
         UnregisterProfiles();
     }
 
@@ -125,6 +133,22 @@ internal sealed class HotkeyManager
         if (!panicRegistered) return;
         UnregisterHotKey(hwndProvider(), HOTKEY_PANIC);
         panicRegistered = false;
+    }
+
+    // F7 toggles pause/resume during a run. Registered run-scoped (armed when a run starts,
+    // released when it stops) for the same reason as the panic key: F7 is a common key
+    // elsewhere (IDEs, games) and must not be claimed while idle.
+    public bool RegisterPause()
+    {
+        pauseRegistered = RegisterHotKey(hwndProvider(), HOTKEY_PAUSE, 0, VK_F7);
+        return pauseRegistered;
+    }
+
+    public void UnregisterPause()
+    {
+        if (!pauseRegistered) return;
+        UnregisterHotKey(hwndProvider(), HOTKEY_PAUSE);
+        pauseRegistered = false;
     }
 
     // Registers one global hotkey per profile that has one assigned, using ids

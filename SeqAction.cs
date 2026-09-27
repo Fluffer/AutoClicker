@@ -25,6 +25,10 @@ public enum ActionKind
     // exact numeric meanings.
     FindImage = 14,
     FindText = 15,
+    // Debugging / control flow (Wave 2). Values 16-17 must stay stable: FormatVersion 4
+    // files rely on their exact numeric meanings.
+    Breakpoint = 16,
+    Else = 17,
 }
 
 /// <summary>
@@ -170,9 +174,9 @@ public sealed class SeqAction
 
     /// <summary>
     /// <see cref="ActionKind.IfElse"/> only: the condition expression, evaluated by the
-    /// expression engine. When it is false the block is skipped past its EndBlock.
-    /// There is deliberately no Else branch — write two IfElse blocks with inverted
-    /// conditions instead.
+    /// expression engine. When it is false the block is skipped to a matching
+    /// <see cref="ActionKind.Else"/> (if one exists between it and its EndBlock) and
+    /// otherwise past its EndBlock.
     /// </summary>
     public string ConditionExpr { get; set; } = "";
 
@@ -319,6 +323,8 @@ public sealed class SeqAction
             ActionKind.Label => $"Label {Label}",
             ActionKind.FindImage => $"Find image ({Percent(MatchThreshold)}){(ClickOnFound ? " → click" : "")}",
             ActionKind.FindText => $"Find text \"{Ellipsis(SingleLine(TextQuery), 32)}\"{(ClickOnFound ? " → click" : "")}",
+            ActionKind.Breakpoint => "Breakpoint",
+            ActionKind.Else => "Else",
             _ => Kind.ToString(),
         };
 
@@ -359,7 +365,8 @@ public sealed class SeqAction
     /// <summary>True for the kinds that structure flow instead of performing input.</summary>
     internal static bool IsControlKind(ActionKind kind) => kind is
         ActionKind.Repeat or ActionKind.EndBlock or ActionKind.IfElse or ActionKind.SetVar
-        or ActionKind.Break or ActionKind.GotoLabel or ActionKind.Label;
+        or ActionKind.Break or ActionKind.GotoLabel or ActionKind.Label
+        or ActionKind.Breakpoint or ActionKind.Else;
 
     /// <summary>
     /// True for the kinds whose own success criterion replaces a pixel gate: each waits for

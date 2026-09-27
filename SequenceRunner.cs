@@ -61,6 +61,7 @@ internal sealed class SequenceRunner
     private readonly Action<int, bool>? onStep;
     private readonly Action<int>? onStepStarting;
     private readonly Action? onPassComplete;
+    private readonly Func<bool>? canProceed;
 
     /// <param name="keepGoing">Polled throughout a run; once it returns false the run unwinds promptly.</param>
     /// <param name="onStep">
@@ -80,13 +81,23 @@ internal sealed class SequenceRunner
     /// end of the list on its own). Not invoked when a pass is cut short by
     /// <paramref name="keepGoing"/> turning false. May be null (headless).
     /// </param>
+    /// <param name="canProceed">
+    /// Optional gate checked immediately before each action is attempted, AFTER
+    /// <see cref="onStepStarting"/> has fired (so a caller can highlight the step that is
+    /// about to run before it blocks). When it returns false the runner waits — sleeping in
+    /// 5 ms slices while still polling <see cref="keepGoing"/>, so a Stop/Panic wakes it
+    /// within ~5 ms — until the gate opens. Null means "always proceed", which is the
+    /// default for headless/test callers. Invoked on the worker thread, synchronously.
+    /// </param>
     public SequenceRunner(Func<bool> keepGoing, Action<int, bool>? onStep = null,
-        Action<int>? onStepStarting = null, Action? onPassComplete = null)
+        Action<int>? onStepStarting = null, Action? onPassComplete = null,
+        Func<bool>? canProceed = null)
     {
         this.keepGoing = keepGoing;
         this.onStep = onStep;
         this.onStepStarting = onStepStarting;
         this.onPassComplete = onPassComplete;
+        this.canProceed = canProceed;
     }
 
     public void RunSingle(SingleRunOptions options)
@@ -160,6 +171,13 @@ internal sealed class SequenceRunner
                         && a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll)
                         CheckCornerFailSafe();
                     onStepStarting?.Invoke(stepIp + indexOffset);
+                    // The gate is checked after onStepStarting so a paused run's pending row
+                    // is already highlighted while it blocks (step-debugging UX). It blocks
+                    // between actions only — never inside a click-hold, which is not a pause
+                    // point by design (the mouse button must be released first). A false
+                    // return means keepGoing went false while blocked (Stop/Panic), so the
+                    // pending action must NOT run.
+                    if (!WaitForGate()) break;
                     bool performed = ExecuteStep(a, options, ref lastTarget, ctx, ref ip);
                     onStep?.Invoke(stepIp + indexOffset, performed);
                     // DelayMs applies after every action, control-flow included, so a tight
@@ -180,12 +198,30 @@ internal sealed class SequenceRunner
         }
     }
 
+    /// <summary>
+    /// Blocks while the caller's gate is closed (e.g. a paused run with no step permit),
+    /// sleeping in 5 ms slices but re-checking <see cref="keepGoing"/> each slice so a Stop
+    /// or Panic wakes it almost immediately instead of waiting out the pause. Returns false
+    /// when <see cref="keepGoing"/> turned false while blocked, signalling the caller to
+    /// abort before the action runs; true means the action may proceed. No gate supplied
+    /// means always proceed.
+    /// </summary>
+    private bool WaitForGate()
+    {
+        while (keepGoing() && canProceed is not null && !canProceed())
+            Thread.Sleep(5);
+        return keepGoing();
+    }
+
     /// <summary>Run-scoped control-flow state: block/label maps, variables, open repeat frames.</summary>
     private sealed class RunContext
     {
         public IReadOnlyList<SeqAction> Actions { get; }
         public Dictionary<int, int> BlockMap { get; }
         public Dictionary<string, int> LabelMap { get; }
+        public Dictionary<int, int> ElseMap { get; }
+        /// <summary>For each paired <see cref="ActionKind.Else"/> index, the index of the block's EndBlock (jump-over target).</summary>
+        public Dictionary<int, int> ElseJump { get; }
         public Dictionary<string, VarValue> Variables { get; }
         public Stack<RepeatFrame> Frames { get; } = new();
 
@@ -201,6 +237,16 @@ internal sealed class SequenceRunner
             Actions = actions;
             BlockMap = ControlFlow.BuildBlockMap(actions);
             LabelMap = ControlFlow.BuildLabelMap(actions);
+            ElseMap = ControlFlow.BuildElseMap(actions);
+            // For each paired If→Else, derive the Else's jump target (past the If's EndBlock)
+            // once, so the Else case in ExecuteStep is a single dictionary hit. Stray Else
+            // markers never appear here and fall through to the no-op branch.
+            ElseJump = new Dictionary<int, int>();
+            foreach (var (ifIp, elseIp) in ElseMap)
+            {
+                int close = BlockMap.TryGetValue(ifIp, out int c) ? c : actions.Count;
+                ElseJump[elseIp] = close;
+            }
             Variables = new Dictionary<string, VarValue>(StringComparer.OrdinalIgnoreCase);
         }
     }
@@ -268,8 +314,38 @@ internal sealed class SequenceRunner
             case ActionKind.IfElse:
             {
                 bool condition = EvaluateCondition(a, ctx);
-                if (condition) ip++;
-                else ip = (ctx.BlockMap.TryGetValue(ip, out int close) ? close : ctx.Actions.Count) + 1;
+                if (condition)
+                {
+                    ip++;
+                }
+                else if (ctx.ElseMap.TryGetValue(ip, out int elseIp))
+                {
+                    // False with an Else: enter the Else body (skip the If body).
+                    ip = elseIp + 1;
+                }
+                else
+                {
+                    // False without an Else: skip past the matching EndBlock.
+                    ip = (ctx.BlockMap.TryGetValue(ip, out int close) ? close : ctx.Actions.Count) + 1;
+                }
+                return true;
+            }
+
+            case ActionKind.Else:
+            {
+                // Reached only when the If body completed normally: jump over the Else body
+                // to just past the block's EndBlock. A stray Else (no If opener) is absent
+                // from ElseJump and falls through as a plain no-op.
+                ip = ctx.ElseJump.TryGetValue(ip, out int close) ? close + 1 : ip + 1;
+                return true;
+            }
+
+            case ActionKind.Breakpoint:
+            {
+                // A breakpoint performs no input itself; the run pauses at it because the
+                // caller's gate is closed from the StepStarting callback that fired just
+                // before it. Advancing past it is a no-op step.
+                ip++;
                 return true;
             }
 

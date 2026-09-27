@@ -142,7 +142,7 @@ internal sealed class ActionEditorForm : Form
         {
             "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only", "Wait for pixel",
             "Repeat (loop)", "End block", "If (conditional)", "Set variable", "Break loop",
-            "Goto label", "Label", "Find image", "Find text",
+            "Goto label", "Label", "Find image", "Find text", "Breakpoint", "Else",
         });
         cmbKind.SelectedIndex = (int)action.Kind;
         cmbKind.SelectedIndexChanged += (_, _) =>

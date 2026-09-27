@@ -38,7 +38,7 @@ public partial class Form1 : Form
 
     // ---- Toolbar + status strip (v2.1 chrome) ----
     private ToolStrip toolStripMain = null!;
-    private ToolStripButton tsRecord = null!, tsPlay = null!, tsStop = null!, tsSave = null!, tsLoad = null!;
+    private ToolStripButton tsRecord = null!, tsPlay = null!, tsStop = null!, tsPause = null!, tsStep = null!, tsSave = null!, tsLoad = null!;
     private ToolStripDropDownButton tsAdd = null!;
     private ToolStripStatusLabel lblState = null!, lblActionCount = null!, lblWaitTotal = null!, lblRunTimer = null!;
     private System.Windows.Forms.Timer? runTimer;
@@ -103,7 +103,9 @@ public partial class Form1 : Form
             () => hotkeyManager.UnregisterPanic(),
             () => hotkeyName,
             () => panicKeyName,
-            MarshalToUi);
+            MarshalToUi,
+            () => hotkeyManager.RegisterPause(),
+            () => hotkeyManager.UnregisterPause());
 
         WireEvents();
 
@@ -137,11 +139,13 @@ public partial class Form1 : Form
         };
         hotkeyManager.EndRecordingPressed += () => { if (recordingController.IsRecording) StopRecording(); };
         hotkeyManager.PanicPressed += () => runController.PanicStop();
+        hotkeyManager.PausePressed += TogglePause;
         hotkeyManager.ProfileHotkeyPressed += HandleProfileHotkey;
         recordingController.ActionRecorded += AddRecordedAction;
         recordingController.EndRecordingRequested += StopRecording;
         runController.StatusChanged += ReportStatus;
         runController.RunningChanged += SetRunningButtonsState;
+        runController.PauseChanged += OnPauseChanged;
         runController.StepStarting += OnRunnerStepStarting;
         runController.StepCompleted += OnRunnerStep;
     }
@@ -463,13 +467,19 @@ public partial class Form1 : Form
         miFromHere.Click += (_, _) => RunFromHere();
         var miRunSelection = new ToolStripMenuItem("Run selection");
         miRunSelection.Click += (_, _) => RunSelection();
+        var miInsertBreakpoint = new ToolStripMenuItem("Insert breakpoint");
+        miInsertBreakpoint.Click += (_, _) => InsertBreakpoint();
         lvMenu.Items.Add(miFromHere);
         lvMenu.Items.Add(miRunSelection);
+        lvMenu.Items.Add(new ToolStripSeparator());
+        lvMenu.Items.Add(miInsertBreakpoint);
         lvMenu.Opening += (_, _) =>
         {
             bool any = lvPoints.SelectedIndices.Count > 0;
             miFromHere.Enabled = any;
             miRunSelection.Enabled = any;
+            // Always available: with no selection the breakpoint goes at the end.
+            miInsertBreakpoint.Enabled = !runController.IsRunning;
         };
         lvPoints.ContextMenuStrip = lvMenu;
 
@@ -870,6 +880,13 @@ public partial class Form1 : Form
         tsStop = new ToolStripButton("■ Stop") { Enabled = false, DisplayStyle = ToolStripItemDisplayStyle.Text };
         tsStop.Click += (_, _) => StopClicking();
 
+        // Pause/Step sit next to Stop and are only meaningful while a sequence run owns the
+        // engine. Step is enabled only while paused (F7 toggles pause; stepping is toolbar-only).
+        tsPause = new ToolStripButton("⏸ Pause") { Enabled = false, DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsPause.Click += (_, _) => TogglePause();
+        tsStep = new ToolStripButton("Step") { Enabled = false, DisplayStyle = ToolStripItemDisplayStyle.Text };
+        tsStep.Click += (_, _) => runController.StepOnce();
+
         tsAdd = new ToolStripDropDownButton("Add ▾") { DisplayStyle = ToolStripItemDisplayStyle.Text };
         tsAdd.DropDownItems.Add(SubMenu("Mouse", ("Click", ActionKind.Click), ("Drag", ActionKind.Drag), ("Scroll", ActionKind.Scroll)));
         tsAdd.DropDownItems.Add(SubMenu("Keyboard", ("Key press", ActionKind.Key), ("Type text", ActionKind.Text)));
@@ -878,10 +895,12 @@ public partial class Form1 : Form
         tsAdd.DropDownItems.Add(SubMenu("Flow",
             ("Repeat (loop)", ActionKind.Repeat),
             ("If (conditional)", ActionKind.IfElse),
+            ("Else", ActionKind.Else),
             ("Set variable", ActionKind.SetVar),
             ("Label", ActionKind.Label),
             ("Goto label", ActionKind.GotoLabel),
-            ("Break loop", ActionKind.Break)));
+            ("Break loop", ActionKind.Break),
+            ("Breakpoint", ActionKind.Breakpoint)));
 
         tsSave = new ToolStripButton("Save…") { DisplayStyle = ToolStripItemDisplayStyle.Text };
         tsSave.Click += (_, _) => SaveSequence();
@@ -891,6 +910,8 @@ public partial class Form1 : Form
         toolStripMain.Items.Add(tsRecord);
         toolStripMain.Items.Add(tsPlay);
         toolStripMain.Items.Add(tsStop);
+        toolStripMain.Items.Add(tsPause);
+        toolStripMain.Items.Add(tsStep);
         toolStripMain.Items.Add(new ToolStripSeparator());
         toolStripMain.Items.Add(tsAdd);
         toolStripMain.Items.Add(new ToolStripSeparator());
@@ -956,6 +977,9 @@ public partial class Form1 : Form
 
     private void UpdateRunTimerTick()
     {
+        // While paused the displayed timer is frozen (and the stopwatch below is stopped),
+        // so the elapsed time excludes paused stretches.
+        if (runController.IsPaused) return;
         TimeSpan elapsed = runTimerStopwatch.Elapsed;
         lblRunTimer.Text = string.Create(CultureInfo.InvariantCulture, $"{elapsed.Minutes:00}:{elapsed.Seconds:00}");
     }
@@ -965,7 +989,10 @@ public partial class Form1 : Form
     {
         if (recordingController.IsRecording) lblState.Text = "Recording";
         else if (runController.IsRunning)
-            lblState.Text = runStepIndex >= 0 ? $"Running {runStepIndex + 1}/{points.Count}" : "Running";
+        {
+            string running = runController.IsPaused ? "Paused" : "Running";
+            lblState.Text = runStepIndex >= 0 ? $"{running} {runStepIndex + 1}/{points.Count}" : running;
+        }
         else lblState.Text = "Ready";
     }
 
@@ -974,10 +1001,12 @@ public partial class Form1 : Form
     /// <summary>
     /// Very light pastel for the sequence list's semantic row groups. Color.Empty means "no
     /// tint" (the caller uses the list's own backcolor). Flow kinds (loops/conditionals/
-    /// jumps) are yellow, visual kinds (FindImage/FindText) green, waits blue.
+    /// jumps) are yellow, visual kinds (FindImage/FindText) green, waits blue, breakpoints a
+    /// distinct light coral (checked before the flow tint so it stands out from If/Repeat).
     /// </summary>
     private static Color RowTint(ActionKind kind)
     {
+        if (kind == ActionKind.Breakpoint) return Color.LightCoral;
         if (SeqAction.IsControlKind(kind)) return Color.LightGoldenrodYellow;
         if (kind is ActionKind.FindImage or ActionKind.FindText) return Color.Honeydew;
         if (kind is ActionKind.Wait or ActionKind.WaitPixel) return Color.Azure;
@@ -1064,6 +1093,19 @@ public partial class Form1 : Form
         if (!chkSequence.Checked) chkSequence.Checked = true;
         lvPoints.Items[^1].Selected = true;
         lblStatus.Text = $"Added action #{points.Count}: {dlg.Result.Describe()}";
+    }
+
+    // Inserts a breakpoint action at the selected row (or the end when nothing is selected),
+    // for cheap discoverability from the list context menu. The breakpoint pauses a running
+    // sequence when the instruction pointer reaches it.
+    private void InsertBreakpoint()
+    {
+        int i = SelectedIndex();
+        int insertAt = i >= 0 ? i : points.Count;
+        points.Insert(insertAt, new SeqAction { Kind = ActionKind.Breakpoint });
+        RefreshList();
+        lvPoints.Items[insertAt].Selected = true;
+        lblStatus.Text = $"Inserted breakpoint at #{insertAt + 1}. It pauses the run when reached.";
     }
 
     private void RemoveSelectedPoint()
@@ -1860,7 +1902,15 @@ public partial class Form1 : Form
     private void OnRunnerStepStarting(int index)
     {
         runStepIndex = index;
-        MarshalToUi(UpdateStateLabel);
+        MarshalToUi(() =>
+        {
+            UpdateStateLabel();
+            // The runner highlights a row and THEN blocks on the pause gate, so a paused run
+            // re-enters this for every step it is about to take: refresh the "Paused at
+            // step N/M" status with the freshly pending row.
+            if (runController.IsPaused)
+                ReportStatus($"Paused at step {index + 1}/{points.Count} — press Step to advance");
+        });
         Highlight(index);
     }
 
@@ -1908,6 +1958,11 @@ public partial class Form1 : Form
         miStop.Enabled = running;
         tsPlay.Enabled = !running;
         tsStop.Enabled = running;
+        // Pause is available whenever a run owns the engine; Step only while paused
+        // (OnPauseChanged flips the caption/enablement on pause transitions).
+        tsPause.Enabled = running;
+        tsPause.Text = "⏸ Pause";
+        tsStep.Enabled = false;
 
         runStepIndex = -1;
         UpdateStateLabel();
@@ -1922,6 +1977,40 @@ public partial class Form1 : Form
         {
             runTimer?.Stop();
             lblRunTimer.Text = "";
+        }
+    }
+
+    private void TogglePause()
+    {
+        if (!runController.IsRunning) return;
+        if (runController.IsPaused) runController.Resume();
+        else runController.Pause();
+    }
+
+    // PauseChanged can arrive on the worker thread (a breakpoint pauses the run from inside
+    // the runner's StepStarting callback), so marshal before touching controls.
+    private void OnPauseChanged(bool paused) => MarshalToUi(() => UpdatePauseUi(paused));
+
+    private void UpdatePauseUi(bool paused)
+    {
+        tsPause.Text = paused ? "▶ Resume" : "⏸ Pause";
+        tsStep.Enabled = paused && runController.IsRunning;
+        UpdateStateLabel();
+
+        if (paused)
+        {
+            // Freeze the displayed run timer: the tick already checks IsPaused, and stopping
+            // the stopwatch here means the elapsed time excludes the paused stretch.
+            runTimer?.Stop();
+            runTimerStopwatch.Stop();
+            ReportStatus(runStepIndex >= 0
+                ? $"Paused at step {runStepIndex + 1}/{points.Count} — press Step to advance"
+                : "Paused — press Step to advance");
+        }
+        else if (runController.IsRunning)
+        {
+            runTimerStopwatch.Start();
+            runTimer?.Start();
         }
     }
 }

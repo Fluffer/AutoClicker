@@ -15,10 +15,12 @@ namespace AutoClicker;
 /// every version up to 1.1.0 wrote, and they must keep loading forever.</item>
 /// <item>Format 1 envelopes (<c>{"FormatVersion":1,"Actions":[...]}</c>) also still load:
 /// they never contain control-flow kinds (7-13), which only exist since format 2.</item>
-/// <item>Current files are format 3: <c>{"FormatVersion":3,"Actions":[...]}</c>, which may
-/// contain the control-flow kinds (7-13) and the visual-targeting kinds (14-15). A format-2/3
-/// file opened in an older build is refused (see <see cref="UnsupportedVersionException"/>)
-/// before any unknown kind can collapse.</item>
+/// <item>Format 2/3 files still load: they contain the control-flow kinds (7-13) and the
+/// visual-targeting kinds (14-15).</item>
+/// <item>Current files are format 4: <c>{"FormatVersion":4,"Actions":[...]}</c>, which may
+/// additionally contain the debugging/control-flow kinds (16-17: Breakpoint and Else). A
+/// format-2/3/4 file opened in an older build is refused (see
+/// <see cref="UnsupportedVersionException"/>) before any unknown kind can collapse.</item>
 /// <item>A file declaring a <b>higher</b> FormatVersion than this build knows is refused
 /// with a clear message instead of being reinterpreted.</item>
 /// </list>
@@ -26,7 +28,7 @@ namespace AutoClicker;
 internal static class SequenceFile
 {
     /// <summary>The newest format version this build reads and writes.</summary>
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 

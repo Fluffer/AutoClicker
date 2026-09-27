@@ -104,6 +104,20 @@ public class ControlFlowTests
         Assert.Equal(new[] { 0, 0 }, ControlFlow.BuildDepth(actions));
     }
 
+    [Fact]
+    public void Depth_aligns_else_with_its_if_opener()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse },   // 0 depth 0
+            new() { Kind = ActionKind.Click },    // 1 depth 1
+            new() { Kind = ActionKind.Else },     // 2 depth 0 (same level as If)
+            new() { Kind = ActionKind.Click },    // 3 depth 1 (else body)
+            new() { Kind = ActionKind.EndBlock }, // 4 depth 0
+        };
+        Assert.Equal(new[] { 0, 1, 0, 1, 0 }, ControlFlow.BuildDepth(actions));
+    }
+
     // ---- Runner semantics (non-input actions only) ----
 
     private static List<int> Run(List<SeqAction> actions, int maxSteps = 1000)
@@ -248,5 +262,123 @@ public class ControlFlowTests
         // keepGoing is flipped off after five executed actions; the loop must not hang.
         var visited = Run(actions, maxSteps: 5);
         Assert.Equal(5, visited.Count);
+    }
+
+    // ---- Else pairing (pure) ----
+
+    [Fact]
+    public void Else_map_pairs_else_with_the_innermost_open_if()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse },   // 0
+            new() { Kind = ActionKind.Wait },     // 1
+            new() { Kind = ActionKind.IfElse },   // 2
+            new() { Kind = ActionKind.Wait },     // 3
+            new() { Kind = ActionKind.EndBlock }, // 4 closes If 2
+            new() { Kind = ActionKind.Else },     // 5 attaches to If 0, not the closed If 2
+            new() { Kind = ActionKind.Wait },     // 6
+            new() { Kind = ActionKind.EndBlock }, // 7 closes If 0
+        };
+        var map = ControlFlow.BuildElseMap(actions);
+        Assert.Single(map);
+        Assert.Equal(5, map[0]);
+    }
+
+    [Fact]
+    public void Else_map_ignores_a_stray_else()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.Else },
+            new() { Kind = ActionKind.Wait },
+        };
+        Assert.Empty(ControlFlow.BuildElseMap(actions));
+    }
+
+    [Fact]
+    public void Else_after_the_if_is_closed_is_stray()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse },   // 0
+            new() { Kind = ActionKind.Wait },     // 1
+            new() { Kind = ActionKind.EndBlock }, // 2 closes If 0
+            new() { Kind = ActionKind.Else },     // 3 stray — nothing open
+        };
+        Assert.Empty(ControlFlow.BuildElseMap(actions));
+    }
+
+    // ---- Else semantics (runner) ----
+
+    [Fact]
+    public void IfElse_with_else_runs_the_else_body_when_false()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "0" }, // 0
+            new() { Kind = ActionKind.Wait },                       // 1 (true body)
+            new() { Kind = ActionKind.Else },                       // 2
+            new() { Kind = ActionKind.Wait },                       // 3 (else body)
+            new() { Kind = ActionKind.EndBlock },                   // 4
+        };
+        // False enters the else body: If, else Wait, EndBlock — the true body is skipped.
+        Assert.Equal(new[] { 0, 3, 4 }, Run(actions));
+    }
+
+    [Fact]
+    public void IfElse_with_else_skips_the_else_body_when_true()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "1" }, // 0
+            new() { Kind = ActionKind.Wait },                       // 1 (true body)
+            new() { Kind = ActionKind.Else },                       // 2 — jump-over
+            new() { Kind = ActionKind.Wait },                       // 3 (else body, skipped)
+            new() { Kind = ActionKind.EndBlock },                   // 4 (skipped)
+        };
+        // True body completes, Else jumps past EndBlock: else body and EndBlock are skipped.
+        Assert.Equal(new[] { 0, 1, 2 }, Run(actions));
+    }
+
+    [Fact]
+    public void Nested_if_else_attaches_each_else_to_its_own_if()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "1" }, // 0 outer true
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "0" }, // 1 inner false
+            new() { Kind = ActionKind.Wait },                       // 2 (inner true body)
+            new() { Kind = ActionKind.Else },                       // 3 (inner else)
+            new() { Kind = ActionKind.Wait },                       // 4 (inner else body)
+            new() { Kind = ActionKind.EndBlock },                   // 5 closes inner
+            new() { Kind = ActionKind.EndBlock },                   // 6 closes outer
+        };
+        // Inner is false: run its else body, close inner, close outer. Outer true body holds.
+        Assert.Equal(new[] { 0, 1, 4, 5, 6 }, Run(actions));
+    }
+
+    [Fact]
+    public void Stray_else_is_a_plain_noop()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.Else }, // 0 — no opener, treated as a no-op
+            new() { Kind = ActionKind.Wait }, // 1
+        };
+        Assert.Equal(new[] { 0, 1 }, Run(actions));
+    }
+
+    [Fact]
+    public void Elseless_if_still_skips_past_end_block_when_false()
+    {
+        var actions = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "0" }, // 0
+            new() { Kind = ActionKind.Wait },                       // 1
+            new() { Kind = ActionKind.EndBlock },                   // 2
+        };
+        // No Else marker: false still jumps past EndBlock, only the header is visited.
+        Assert.Equal(new[] { 0 }, Run(actions));
     }
 }

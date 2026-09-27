@@ -83,6 +83,16 @@ internal sealed class RunController : IDisposable
     private volatile bool running;
     private int busy; // 0 = idle, 1 = a worker owns the engine. Guards start/stop overlap.
     private bool panicStopped;
+    // ---- Pause / step debugging ----
+    // `running` stays true while paused: the run still owns `busy`, and KeepGoing keeps
+    // returning true so the worker's own loops stay alive. Freezing happens at the gate the
+    // runner checks between actions (see CanProceed), never inside a click-hold.
+    private volatile bool paused;
+    private int stepGranted; // 0 = no permit, 1 = exactly one step may run while paused.
+    private List<SeqAction>? runActions; // the running sequence, for breakpoint detection.
+    private string runDescription = "";
+    private readonly Func<bool>? armPause;
+    private readonly Action? disarmPause;
     private System.Windows.Forms.Timer? startDelayTimer;
     private int startDelayCountdown;
     private readonly System.Diagnostics.Stopwatch runStopwatch = new();
@@ -117,14 +127,17 @@ internal sealed class RunController : IDisposable
     private bool failSafeStopped;
 
     public RunController(Func<bool> armPanic, Action disarmPanic, Func<string> hotkeyNameProvider,
-        Func<string> panicKeyNameProvider, Action<Action> uiMarshal)
+        Func<string> panicKeyNameProvider, Action<Action> uiMarshal,
+        Func<bool>? armPause = null, Action? disarmPause = null)
     {
         this.armPanic = armPanic;
         this.disarmPanic = disarmPanic;
         this.hotkeyNameProvider = hotkeyNameProvider;
         this.panicKeyNameProvider = panicKeyNameProvider;
         this.uiMarshal = uiMarshal;
-        runner = new SequenceRunner(KeepGoing, OnRunnerStep, OnRunnerStepStarting, OnRunnerPassComplete);
+        this.armPause = armPause;
+        this.disarmPause = disarmPause;
+        runner = new SequenceRunner(KeepGoing, OnRunnerStep, OnRunnerStepStarting, OnRunnerPassComplete, CanProceed);
     }
 
     /// <summary>Raised when the status line should change.</summary>
@@ -142,9 +155,15 @@ internal sealed class RunController : IDisposable
     /// <summary>Raised when a run's worker finishes (on the worker thread).</summary>
     public event Action? RunFinished;
 
+    /// <summary>Raised when the pause state changes, on the thread that changed it (UI or worker — marshal before touching controls).</summary>
+    public event Action<bool>? PauseChanged;
+
     public bool IsRunning => running;
 
     public bool IsBusy => Volatile.Read(ref busy) != 0;
+
+    /// <summary>True while a running sequence is frozen at the gate between actions.</summary>
+    public bool IsPaused => paused;
 
     /// <summary>Claims the engine and starts (or schedules) the run described by <paramref name="spec"/>.</summary>
     public bool TryStart(RunSpec spec)
@@ -168,6 +187,11 @@ internal sealed class RunController : IDisposable
         runLoggingEnabled = spec.RunLoggingEnabled;
         failSafeStopped = false;
         restoreCursor = spec.RestoreCursorAfterRun;
+        // Every run starts unpaused, with no outstanding step permit and no stale sequence
+        // from the previous run (breakpoint detection is keyed off `runActions`).
+        paused = false;
+        Interlocked.Exchange(ref stepGranted, 0);
+        runActions = null;
         // Captured once, before any worker (or even a start-delay countdown) can move the
         // cursor — this is "where the user left it", not wherever a delay happened to end.
         if (restoreCursor) GetCursorPos(out startCursor);
@@ -178,6 +202,17 @@ internal sealed class RunController : IDisposable
         string panicWarn = spec.PanicEnabled && !panicArmed
             ? $" {panicKeyNameProvider()} is already claimed by another app — panic key OFF."
             : "";
+        // F7 toggles pause/resume only while a run is live, so it is armed per run exactly
+        // like the panic key. Pause is a sequence-only feature (single-click runs have no
+        // between-action gate to freeze on), so F7 is only claimed for sequence runs. If F7
+        // is already claimed (the main hotkey, a profile, or another app) the run still
+        // works — the pause key is just reported OFF.
+        bool pauseArmed = !spec.UseSequence || armPause is null || armPause();
+        string pauseWarn = spec.UseSequence && !pauseArmed
+            ? " F7 (pause/step) is already claimed by another app — pause hotkey OFF."
+            : "";
+        // Remembered so Resume() can restore the running status line after a pause.
+        runDescription = spec.RunDescription + panicWarn + pauseWarn;
 
         // Build the thread now, capturing every run parameter at the moment Start was
         // pressed — not after a delay elapses — so nothing the user changes mid-countdown
@@ -223,7 +258,7 @@ internal sealed class RunController : IDisposable
 
         if (spec.StartDelaySeconds <= 0)
         {
-            StatusChanged?.Invoke(spec.RunDescription + panicWarn);
+            StatusChanged?.Invoke(runDescription);
             StartWorkerThread();
             return true;
         }
@@ -242,7 +277,7 @@ internal sealed class RunController : IDisposable
             startDelayTimer!.Stop();
             startDelayTimer.Dispose();
             startDelayTimer = null;
-            StatusChanged?.Invoke(spec.RunDescription + panicWarn);
+            StatusChanged?.Invoke(runDescription);
             StartWorkerThread();
         };
         startDelayTimer.Start();
@@ -252,6 +287,7 @@ internal sealed class RunController : IDisposable
     public void Stop()
     {
         running = false;
+        ClearPauseState();
         CancelPendingStartDelay();
     }
 
@@ -263,9 +299,71 @@ internal sealed class RunController : IDisposable
         panicStopped = true;
         CancelPendingStartDelay();
         running = false;
+        ClearPauseState();
         InputSender.ReleaseAllButtons();
         StatusChanged?.Invoke(PanicMessage);
     }
+
+    /// <summary>Freezes a running sequence between actions. No-op when not running or already paused.</summary>
+    public void Pause()
+    {
+        if (!running || paused) return;
+        EnterPaused();
+    }
+
+    /// <summary>Resumes a paused run. No-op when not paused.</summary>
+    public void Resume()
+    {
+        if (!paused) return;
+        paused = false;
+        Interlocked.Exchange(ref stepGranted, 0);
+        PauseChanged?.Invoke(false);
+        StatusChanged?.Invoke(runDescription);
+    }
+
+    /// <summary>Grants exactly one step to a paused run. No-op unless paused while running.</summary>
+    public void StepOnce()
+    {
+        if (!running || !paused) return;
+        Interlocked.Exchange(ref stepGranted, 1);
+    }
+
+    /// <summary>Enters the paused state, discarding any pending permit and notifying listeners.</summary>
+    private void EnterPaused()
+    {
+        paused = true;
+        Interlocked.Exchange(ref stepGranted, 0);
+        PauseChanged?.Invoke(true);
+    }
+
+    /// <summary>Clears pause state after a stop/panic/run end, notifying listeners only on a real change.</summary>
+    private void ClearPauseState()
+    {
+        if (!paused && stepGranted == 0) return;
+        paused = false;
+        Interlocked.Exchange(ref stepGranted, 0);
+        PauseChanged?.Invoke(false);
+    }
+
+    /// <summary>
+    /// The gate the runner polls before each action. While not paused it is open; while
+    /// paused it is open only when a single step permit is pending, and consuming that
+    /// permit re-closes it — so StepOnce advances exactly one action. The permit math is
+    /// <see cref="ConsumePermit"/>, extracted pure for tests.
+    /// </summary>
+    private bool CanProceed()
+    {
+        if (!paused) return true;
+        return ConsumePermit(ref stepGranted);
+    }
+
+    /// <summary>
+    /// Consumes a pending step permit: true exactly once when a permit was set (advancing
+    /// one action), leaving no permit behind so the next gate check blocks again. Pure and
+    /// static for tests.
+    /// </summary>
+    internal static bool ConsumePermit(ref int stepGranted) =>
+        Interlocked.Exchange(ref stepGranted, 0) == 1;
 
     // Cancels a pending start-delay countdown, if any. The thread built in TryStart was
     // never started in that case, so Finish() will never run for it — this is the only
@@ -348,6 +446,7 @@ internal sealed class RunController : IDisposable
         // The logger is created on the worker thread so its clock starts at run start, and
         // disposed here so its file is flushed exactly once per run, even on an abort.
         currentPass = 0;
+        runActions = acts; // breakpoint detection in OnRunnerStepStarting reads this
         runLogger = runLoggingEnabled ? RunLogger.TryCreate() : null;
         logActions = runLogger is not null ? acts : null;
         try { runner.RunSequence(acts, options); }
@@ -380,8 +479,19 @@ internal sealed class RunController : IDisposable
     }
 
     // Surfaces the engine's per-step callbacks as events; the form subscribes to drive the
-    // list highlighting.
-    private void OnRunnerStepStarting(int index) => StepStarting?.Invoke(index);
+    // list highlighting. The runner calls this BEFORE its gate check, so pausing here (a
+    // breakpoint) freezes the run with the row already highlighted.
+    private void OnRunnerStepStarting(int index)
+    {
+        // A breakpoint pauses the run automatically — same gate as Pause(). Reaching one
+        // mid-run enters the paused state; the user then steps or resumes past it.
+        if (index >= 0 && runActions is not null && index < runActions.Count
+            && runActions[index].Kind == ActionKind.Breakpoint)
+        {
+            EnterPaused();
+        }
+        StepStarting?.Invoke(index);
+    }
 
     // Surfaces the engine's per-step completion (or suppression) as an event; index -1
     // means the run ended and any highlight should be cleared.
@@ -444,6 +554,7 @@ internal sealed class RunController : IDisposable
     {
         running = false;
         RestoreCursorIfNeeded();
+        ClearPauseState(); // a run that ended while paused (e.g. watchdog) must not stay paused
         RunFinished?.Invoke();
         uiMarshal(OnStopped);
         // Released last: TryStart must not be able to claim the engine until this worker
@@ -466,6 +577,7 @@ internal sealed class RunController : IDisposable
     private void OnStopped()
     {
         disarmPanic();
+        disarmPause?.Invoke();
         mouseMoveWatcher?.Stop();
         mouseMoveWatcher = null;
         RunningChanged?.Invoke(false);

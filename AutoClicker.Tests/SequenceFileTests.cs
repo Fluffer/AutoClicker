@@ -108,12 +108,22 @@ public class SequenceFileTests
     }
 
     [Fact]
-    public void Format_version_4_is_refused()
+    public void Format_version_5_is_refused()
     {
-        const string future = """{"FormatVersion":4,"Actions":[{"Kind":7}]}""";
+        const string future = """{"FormatVersion":5,"Actions":[{"Kind":7}]}""";
         var ex = Assert.Throws<SequenceFile.UnsupportedVersionException>(
             () => SequenceFile.Deserialize(future));
-        Assert.Contains("4", ex.Message);
+        Assert.Contains("5", ex.Message);
+    }
+
+    [Fact]
+    public void Format_version_4_file_loads_breakpoint_and_else_kinds()
+    {
+        const string v4 = """{"FormatVersion":4,"Actions":[{"Kind":16},{"Kind":17}]}""";
+        var actions = SequenceFile.Deserialize(v4);
+        Assert.Equal(2, actions.Count);
+        Assert.Equal(ActionKind.Breakpoint, actions[0].Kind);
+        Assert.Equal(ActionKind.Else, actions[1].Kind);
     }
 
     [Fact]
@@ -192,6 +202,29 @@ public class SequenceFileTests
             Assert.Equal(original[i].ValueExpr, back[i].ValueExpr);
             Assert.Equal(original[i].ConditionExpr, back[i].ConditionExpr);
             Assert.Equal(original[i].Label, back[i].Label);
+        }
+    }
+
+    [Fact]
+    public void Round_trip_preserves_breakpoint_and_else_kinds()
+    {
+        var original = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "x == 1" },
+            new() { Kind = ActionKind.Wait },
+            new() { Kind = ActionKind.Else },
+            new() { Kind = ActionKind.Breakpoint },
+            new() { Kind = ActionKind.EndBlock },
+        };
+
+        string json = SequenceFile.Serialize(original);
+        var back = SequenceFile.Deserialize(json);
+
+        Assert.Equal(original.Count, back.Count);
+        for (int i = 0; i < original.Count; i++)
+        {
+            Assert.Equal(original[i].Kind, back[i].Kind);
+            Assert.Equal(original[i].ConditionExpr, back[i].ConditionExpr);
         }
     }
 }

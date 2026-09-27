@@ -39,6 +39,44 @@ internal static class ControlFlow
         return map;
     }
 
+    /// <summary>
+    /// Maps each <see cref="ActionKind.IfElse"/> opener index to the index of its
+    /// <see cref="ActionKind.Else"/> marker, when one exists between the opener and its
+    /// matching <see cref="ActionKind.EndBlock"/>. An <c>Else</c> attaches to the innermost
+    /// still-open IfElse; an Else with no open IfElse (a stray marker) is absent from the
+    /// map and is treated as a no-op by the runner. A Repeat block between an If and its
+    /// Else does not break the pairing — Repeats are not If-scopes.
+    /// </summary>
+    public static Dictionary<int, int> BuildElseMap(IReadOnlyList<SeqAction> actions)
+    {
+        var elseMap = new Dictionary<int, int>();
+        var openers = new Stack<int>(); // indices of open Repeat/IfElse openers
+        var openIfs = new Stack<int>(); // indices of open IfElse openers (subset of openers)
+
+        for (int i = 0; i < actions.Count; i++)
+        {
+            switch (actions[i].Kind)
+            {
+                case ActionKind.Repeat:
+                    openers.Push(i);
+                    break;
+                case ActionKind.IfElse:
+                    openers.Push(i);
+                    openIfs.Push(i);
+                    break;
+                case ActionKind.Else:
+                    if (openIfs.Count > 0) elseMap[openIfs.Peek()] = i;
+                    break;
+                case ActionKind.EndBlock:
+                    if (openers.Count > 0 && actions[openers.Pop()].Kind == ActionKind.IfElse)
+                        openIfs.Pop();
+                    break;
+            }
+        }
+
+        return elseMap;
+    }
+
     /// <summary>Maps a label name to the index of its <see cref="ActionKind.Label"/>. First wins.</summary>
     public static Dictionary<string, int> BuildLabelMap(IReadOnlyList<SeqAction> actions)
     {
@@ -54,7 +92,10 @@ internal static class ControlFlow
 
     /// <summary>
     /// Nesting depth of each action, for indenting the sequence list. Repeat/IfElse push,
-    /// EndBlock pops. Depth never goes negative: a stray EndBlock clamps at zero.
+    /// EndBlock pops. An <see cref="ActionKind.Else"/> sits at the same depth as its
+    /// <see cref="ActionKind.IfElse"/> opener (one level shallower than the body it
+    /// separates), so <c>else</c> aligns with <c>if</c>. Depth never goes negative: a stray
+    /// EndBlock clamps at zero.
     /// </summary>
     public static int[] BuildDepth(IReadOnlyList<SeqAction> actions)
     {
@@ -72,6 +113,9 @@ internal static class ControlFlow
                 case ActionKind.IfElse:
                     depth[i] = d;
                     d++;
+                    break;
+                case ActionKind.Else:
+                    depth[i] = Math.Max(0, d - 1);
                     break;
                 default:
                     depth[i] = d;
