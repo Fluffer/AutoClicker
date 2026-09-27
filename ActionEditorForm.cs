@@ -1,3 +1,5 @@
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 using static AutoClicker.Native;
 
 namespace AutoClicker;
@@ -59,6 +61,24 @@ internal sealed class ActionEditorForm : Form
     private readonly Label lblVarHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
     private readonly ComboBox cmbLabel = new() { DropDownStyle = ComboBoxStyle.DropDown, Width = 200, Margin = new Padding(3, 4, 3, 3) };
 
+    // ---- Visual targeting (FindImage / FindText) ----
+    private readonly Button btnCaptureTemplate = new() { Text = "Capture template (3s)…", AutoSize = true, Margin = new Padding(6, 3, 3, 3) };
+    private readonly Button btnBrowseTemplate = new() { Text = "Browse image…", AutoSize = true, Margin = new Padding(6, 3, 3, 3) };
+    private readonly PictureBox picTemplate = new() { SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle, Size = new Size(96, 96), Margin = new Padding(3, 4, 3, 3) };
+    private readonly NumericUpDown numTemplateSize = NewNum(8, 256);
+    private readonly NumericUpDown numThreshold = new() { Minimum = 0.5m, Maximum = 1.0m, DecimalPlaces = 2, Increment = 0.05m, Width = 90, Margin = new Padding(3, 4, 3, 3) };
+    private readonly NumericUpDown numSearchX = NewNum(-100000, 100000);
+    private readonly NumericUpDown numSearchY = NewNum(-100000, 100000);
+    private readonly NumericUpDown numSearchW = NewNum(0, 100000);
+    private readonly NumericUpDown numSearchH = NewNum(0, 100000);
+    private readonly Label lblSearchHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+    private readonly CheckBox chkClickOnFound = new() { Text = "Click the found target", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+    private readonly NumericUpDown numClickOffsetX = NewNum(-100000, 100000);
+    private readonly NumericUpDown numClickOffsetY = NewNum(-100000, 100000);
+    private readonly TextBox txtTextQuery = new() { Width = 260, Margin = new Padding(3, 4, 3, 3) };
+    private readonly CheckBox chkRegexQuery = new() { Text = "Treat as regular expression", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+    private readonly Label lblVisualHint = new() { AutoSize = true, MaximumSize = new Size(340, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+
     private readonly List<(Control label, Control field, Func<ActionKind, bool> visibleFor)> rows = new();
     private readonly Button btnOk;
 
@@ -69,6 +89,12 @@ internal sealed class ActionEditorForm : Form
     // Second phase of the pick: cursor parked away from the target, waiting for it to
     // repaint its resting colour before the sample is taken.
     private bool pickPixelSettling;
+    private System.Windows.Forms.Timer? captureTemplateTimer;
+    private int captureTemplateCountdown;
+
+    // The FindImage template held by the editor. Kept as PNG bytes (not a Bitmap) so it
+    // round-trips through the .acseq format exactly; the PictureBox shows a decoded preview.
+    private byte[]? currentTemplate;
 
     // Window anchoring keeps both representations so toggling the checkbox can convert
     // between them instead of throwing the coordinates away.
@@ -111,7 +137,7 @@ internal sealed class ActionEditorForm : Form
         {
             "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only", "Wait for pixel",
             "Repeat (loop)", "End block", "If (conditional)", "Set variable", "Break loop",
-            "Goto label", "Label",
+            "Goto label", "Label", "Find image", "Find text",
         });
         cmbKind.SelectedIndex = (int)action.Kind;
         cmbKind.SelectedIndexChanged += (_, _) =>
@@ -149,6 +175,27 @@ internal sealed class ActionEditorForm : Form
         swatchFlow.Controls.Add(pnlSwatch);
         swatchFlow.Controls.Add(lblSwatchText);
 
+        var templateFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        templateFlow.Controls.Add(btnCaptureTemplate);
+        templateFlow.Controls.Add(btnBrowseTemplate);
+        btnCaptureTemplate.Click += (_, _) => StartCaptureTemplate();
+        btnBrowseTemplate.Click += (_, _) => BrowseTemplate();
+
+        var searchPosFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        searchPosFlow.Controls.Add(numSearchX);
+        searchPosFlow.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
+        searchPosFlow.Controls.Add(numSearchY);
+
+        var searchSizeFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        searchSizeFlow.Controls.Add(numSearchW);
+        searchSizeFlow.Controls.Add(new Label { Text = "H", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
+        searchSizeFlow.Controls.Add(numSearchH);
+
+        var clickOffsetFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        clickOffsetFlow.Controls.Add(numClickOffsetX);
+        clickOffsetFlow.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(6, 7, 3, 3) });
+        clickOffsetFlow.Controls.Add(numClickOffsetY);
+
         AddRow(root, "Action:", cmbKind, _ => true);
         AddRow(root, "Position  X", posFlow, k => UsesPosition(k));
         AddRow(root, "", chkAnchor, k => UsesPosition(k));
@@ -168,15 +215,16 @@ internal sealed class ActionEditorForm : Form
 
         // Pixel condition rows apply to every input kind: any action can be gated on a pixel
         // colour, and a WaitPixel action IS the wait built from these same fields. Control-flow
-        // kinds ignore gates entirely, so the rows hide for them (a gate there would do nothing).
-        AddRow(root, "Pixel condition:", cmbCondition, k => !SeqAction.IsControlKind(k));
-        AddRow(root, "Pixel point  X", condPosFlow, k => !SeqAction.IsControlKind(k));
-        AddRow(root, "Pixel color:", swatchFlow, k => !SeqAction.IsControlKind(k));
-        AddRow(root, "Tolerance:", numTolerance, k => !SeqAction.IsControlKind(k));
-        AddRow(root, "", lblToleranceHint, k => !SeqAction.IsControlKind(k));
-        AddRow(root, "Wait timeout (ms, 0 = forever):", numPixelTimeout, k => k == ActionKind.WaitPixel);
-        AddRow(root, "", chkAbortOnTimeout, k => k == ActionKind.WaitPixel);
-        AddRow(root, "Check every (ms):", numPollInterval, k => k == ActionKind.WaitPixel);
+        // kinds ignore gates entirely, so the rows hide for them (a gate there would do nothing);
+        // FindImage/FindText are their own wait and hide them too.
+        AddRow(root, "Pixel condition:", cmbCondition, UsesPixelCondition);
+        AddRow(root, "Pixel point  X", condPosFlow, UsesPixelCondition);
+        AddRow(root, "Pixel color:", swatchFlow, UsesPixelCondition);
+        AddRow(root, "Tolerance:", numTolerance, UsesPixelCondition);
+        AddRow(root, "", lblToleranceHint, UsesPixelCondition);
+        AddRow(root, "Wait timeout (ms, 0 = forever):", numPixelTimeout, k => SeqAction.IsWaitKind(k));
+        AddRow(root, "", chkAbortOnTimeout, k => SeqAction.IsWaitKind(k));
+        AddRow(root, "Check every (ms):", numPollInterval, k => SeqAction.IsWaitKind(k));
 
         // Control-flow rows: each new kind shows only the fields it uses.
         AddRow(root, "Repeat count:", numRepeatCount, k => k == ActionKind.Repeat);
@@ -187,6 +235,20 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "Value:", txtValueExpr, k => k == ActionKind.SetVar);
         AddRow(root, "", lblVarHint, k => k == ActionKind.SetVar);
         AddRow(root, "Label:", cmbLabel, k => k is ActionKind.GotoLabel or ActionKind.Label);
+
+        // Visual-targeting rows.
+        AddRow(root, "Template:", templateFlow, k => k == ActionKind.FindImage);
+        AddRow(root, "Template size (px):", numTemplateSize, k => k == ActionKind.FindImage);
+        AddRow(root, "", picTemplate, k => k == ActionKind.FindImage);
+        AddRow(root, "", lblVisualHint, k => k == ActionKind.FindImage);
+        AddRow(root, "Match threshold:", numThreshold, k => k == ActionKind.FindImage);
+        AddRow(root, "Find text:", txtTextQuery, k => k == ActionKind.FindText);
+        AddRow(root, "", chkRegexQuery, k => k == ActionKind.FindText);
+        AddRow(root, "Search area  X", searchPosFlow, k => k is ActionKind.FindImage or ActionKind.FindText);
+        AddRow(root, "Search size  W", searchSizeFlow, k => k is ActionKind.FindImage or ActionKind.FindText);
+        AddRow(root, "", lblSearchHint, k => k is ActionKind.FindImage or ActionKind.FindText);
+        AddRow(root, "", chkClickOnFound, k => k is ActionKind.FindImage or ActionKind.FindText);
+        AddRow(root, "Click offset  X", clickOffsetFlow, k => k is ActionKind.FindImage or ActionKind.FindText);
 
         AddRow(root, "Wait after (ms):", numDelay, _ => true);
 
@@ -230,6 +292,24 @@ internal sealed class ActionEditorForm : Form
         PopulateLabels();
         cmbLabel.Text = action.Label;
 
+        // Visual targeting.
+        currentTemplate = action.TemplatePng;
+        numTemplateSize.Value = 60;
+        numThreshold.Value = Math.Clamp((decimal)action.MatchThreshold, numThreshold.Minimum, numThreshold.Maximum);
+        numSearchX.Value = action.SearchX;
+        numSearchY.Value = action.SearchY;
+        numSearchW.Value = action.SearchW;
+        numSearchH.Value = action.SearchH;
+        chkClickOnFound.Checked = action.ClickOnFound;
+        numClickOffsetX.Value = action.ClickOffsetX;
+        numClickOffsetY.Value = action.ClickOffsetY;
+        txtTextQuery.Text = action.TextQuery;
+        chkRegexQuery.Checked = action.RegexQuery;
+        lblSearchHint.Text = "0×0 = search the full screen. Screen coordinates; a monitor left of the primary is negative.";
+        lblVisualHint.Text = "Captures a fixed-size square centred on the cursor when the countdown ends.\r\n"
+                          + "The template must be captured at the same display scale it is replayed at.";
+        UpdateTemplatePreview();
+
         chkAnchor.CheckedChanged += (_, _) => AnchorToggled();
         cmbClickMethod.SelectedIndexChanged += (_, _) => UpdateClickMethodHint();
         txtCombo.TextChanged += (_, _) => ValidateCombo();
@@ -259,6 +339,13 @@ internal sealed class ActionEditorForm : Form
     }
 
     private static bool UsesPosition(ActionKind k) => k is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
+
+    /// <summary>
+    /// Whether a kind shows the pixel-condition rows. WaitPixel uses them (it IS the wait),
+    /// but FindImage/FindText do not — their own success criterion replaces the gate.
+    /// </summary>
+    private static bool UsesPixelCondition(ActionKind k) =>
+        !SeqAction.IsControlKind(k) && k is not ActionKind.FindImage and not ActionKind.FindText;
 
     private ActionKind SelectedKind => (ActionKind)Math.Max(0, cmbKind.SelectedIndex);
 
@@ -479,6 +566,100 @@ internal sealed class ActionEditorForm : Form
         numY.Value = Math.Clamp(p.Y, numY.Minimum, numY.Maximum);
     }
 
+    // ---- Template capture / load ----
+
+    /// <summary>
+    /// Same countdown idiom as <see cref="StartPick"/>/<see cref="StartPickPixel"/>. When it
+    /// ends, a fixed-size square centred on the cursor is captured as the template — the
+    /// pragmatic alternative to a drag-select overlay (a full selection rectangle needs a
+    /// borderless overlay form to be usable, which is out of scope for this phase). The size
+    /// is adjustable, and a PNG can also be loaded instead.
+    /// </summary>
+    private void StartCaptureTemplate()
+    {
+        captureTemplateCountdown = 3;
+        btnCaptureTemplate.Enabled = false;
+        captureTemplateTimer?.Dispose();
+        captureTemplateTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        btnCaptureTemplate.Text = $"{captureTemplateCountdown}…";
+        captureTemplateTimer.Tick += (_, _) =>
+        {
+            if (--captureTemplateCountdown > 0) { btnCaptureTemplate.Text = $"{captureTemplateCountdown}…"; return; }
+
+            captureTemplateTimer!.Stop();
+            captureTemplateTimer.Dispose();
+            captureTemplateTimer = null;
+            btnCaptureTemplate.Text = "Capture template (3s)…";
+            btnCaptureTemplate.Enabled = true;
+
+            GetCursorPos(out POINT p);
+            CaptureTemplateAt(p);
+        };
+        captureTemplateTimer.Start();
+    }
+
+    private void CaptureTemplateAt(POINT cursor)
+    {
+        int size = (int)numTemplateSize.Value;
+        int half = size / 2;
+        var region = new Rectangle(cursor.X - half, cursor.Y - half, size, size);
+        try
+        {
+            using Bitmap bmp = ImageMatcher.CaptureRegion(region);
+            using var ms = new MemoryStream();
+            bmp.Save(ms, ImageFormat.Png);
+            currentTemplate = ms.ToArray();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException
+                                   or System.ComponentModel.Win32Exception or ExternalException)
+        {
+            MessageBox.Show(this, ex.Message, "Template capture failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        UpdateTemplatePreview();
+    }
+
+    /// <summary>Loads a PNG from disk instead of capturing, for templates the user already has.</summary>
+    private void BrowseTemplate()
+    {
+        using var ofd = new OpenFileDialog { Filter = "PNG image (*.png)|*.png|All files (*.*)|*.*", Title = "Load template image" };
+        if (ofd.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(ofd.FileName);
+            using var probe = new Bitmap(new MemoryStream(bytes)); // validate it decodes
+            currentTemplate = bytes;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show(this, ex.Message, "Template load failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        UpdateTemplatePreview();
+    }
+
+    private void UpdateTemplatePreview()
+    {
+        if (currentTemplate is null || currentTemplate.Length == 0)
+        {
+            picTemplate.Image = null;
+            picTemplate.BackColor = SystemColors.Control;
+            return;
+        }
+        try
+        {
+            using var ms = new MemoryStream(currentTemplate);
+            using var bmp = new Bitmap(ms);
+            picTemplate.Image = new Bitmap(bmp); // keep a copy: the source stream is disposed
+            picTemplate.BackColor = SystemColors.Control;
+        }
+        catch (ArgumentException)
+        {
+            picTemplate.Image = null;
+            picTemplate.BackColor = SystemColors.Control;
+        }
+    }
+
     /// <summary>Converts the coordinates already on screen rather than discarding them.</summary>
     private void AnchorToggled()
     {
@@ -614,6 +795,19 @@ internal sealed class ActionEditorForm : Form
             e.Cancel = true;
             return;
         }
+        if (kind == ActionKind.FindImage && (currentTemplate is null || currentTemplate.Length == 0))
+        {
+            MessageBox.Show(this, "Capture or load a template image first.", "No template",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = true;
+            return;
+        }
+        if (kind == ActionKind.FindText && txtTextQuery.Text.Trim().Length == 0)
+        {
+            MessageBox.Show(this, "Type the text to find.", "Empty text", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = true;
+            return;
+        }
 
         action.Kind = kind;
         action.X = (int)numX.Value;
@@ -646,6 +840,17 @@ internal sealed class ActionEditorForm : Form
         action.VarName = txtVarName.Text.Trim();
         action.ValueExpr = txtValueExpr.Text.Trim();
         action.Label = cmbLabel.Text.Trim();
+        action.TemplatePng = currentTemplate;
+        action.MatchThreshold = (double)numThreshold.Value;
+        action.SearchX = (int)numSearchX.Value;
+        action.SearchY = (int)numSearchY.Value;
+        action.SearchW = (int)numSearchW.Value;
+        action.SearchH = (int)numSearchH.Value;
+        action.ClickOnFound = chkClickOnFound.Checked;
+        action.ClickOffsetX = (int)numClickOffsetX.Value;
+        action.ClickOffsetY = (int)numClickOffsetY.Value;
+        action.TextQuery = txtTextQuery.Text;
+        action.RegexQuery = chkRegexQuery.Checked;
         action.Normalize();
     }
 
@@ -659,6 +864,9 @@ internal sealed class ActionEditorForm : Form
             pickPixelTimer?.Stop();
             pickPixelTimer?.Dispose();
             pickPixelTimer = null;
+            captureTemplateTimer?.Stop();
+            captureTemplateTimer?.Dispose();
+            captureTemplateTimer = null;
         }
         base.Dispose(disposing);
     }

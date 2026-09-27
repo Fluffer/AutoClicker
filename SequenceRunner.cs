@@ -261,7 +261,7 @@ internal sealed class SequenceRunner
 
             default:
                 ip++;
-                return Execute(a, options.Background, options.JitterPixels, ref lastTarget);
+                return Execute(a, options.Background, options.JitterPixels, ref lastTarget, ctx);
         }
     }
 
@@ -273,7 +273,8 @@ internal sealed class SequenceRunner
     }
 
     /// <summary>
-    /// Evaluates the pixel gate on an ordinary (non-<see cref="ActionKind.WaitPixel"/>) action.
+    /// Evaluates the pixel gate on an ordinary (non-wait-kind) action. WaitPixel/FindImage/
+    /// FindText never reach this: their own success criterion replaces the gate.
     /// A failed sample — the point falls off every display — counts as "not matching", the same
     /// rule <see cref="PixelSampler.WaitUntil"/> applies.
     /// </summary>
@@ -287,13 +288,14 @@ internal sealed class SequenceRunner
     /// <summary>
     /// Performs one ordinary sequence step. Returns false when a pixel gate suppressed it.
     /// Control-flow kinds never reach here — <see cref="ExecuteStep"/> handles them before
-    /// delegating — so this method only ever sees input kinds (and WaitPixel).
+    /// delegating — so this method only ever sees input kinds and the wait kinds (WaitPixel,
+    /// FindImage, FindText).
     /// </summary>
-    private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
+    private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget, RunContext ctx)
     {
-        // A gate only applies to ordinary actions — WaitPixel is itself the wait mechanism, so
-        // its Condition means "what to wait for" instead (see SeqAction.Condition).
-        if (a.Kind != ActionKind.WaitPixel && a.Condition != PixelCondition.None && !GateOpen(a))
+        // A gate only applies to ordinary actions — the wait kinds are themselves the wait
+        // mechanism, so their Condition means "what to wait for" instead (see SeqAction.Condition).
+        if (!SeqAction.IsWaitKind(a.Kind) && a.Condition != PixelCondition.None && !GateOpen(a))
         {
             // The caller still applies a.DelayMs after a skip: skipping the delay too would let
             // a run of gated-off actions spin the CPU at full speed waiting for their condition
@@ -315,6 +317,9 @@ internal sealed class SequenceRunner
 
             return true;
         }
+
+        if (a.Kind is ActionKind.FindImage or ActionKind.FindText)
+            return ExecuteVisualFind(a, background, jitterPx, ref lastTarget, ctx);
 
         bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
         int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
@@ -346,21 +351,7 @@ internal sealed class SequenceRunner
         switch (a.Kind)
         {
             case ActionKind.Click:
-                if (method == 2)
-                {
-                    // Soft failure by design: TryInvokeAt returns false when there's simply no
-                    // invokable element under the point (or COM misbehaved), which is not a
-                    // reason to abort the run -- the action was still attempted, so it counts
-                    // as performed either way. DoubleClick/Button/HoldMs are ignored here: an
-                    // invoke activates a control rather than synthesizing a physical click, so a
-                    // user who set "right double-click + UIA" would otherwise be quietly
-                    // surprised that none of that took effect.
-                    UiaInvoker.TryInvokeAt(x, y, out _);
-                }
-                // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
-                // panic key wait out the whole hold before taking effect.
-                else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
-                else { MoveToOrFail(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
+                DispatchClick(a, x, y, method);
                 break;
 
             case ActionKind.Drag:
@@ -393,6 +384,123 @@ internal sealed class SequenceRunner
 
         return true;
     }
+
+    /// <summary>
+    /// Performs the click for a <see cref="ActionKind.Click"/> action at resolved coordinates.
+    /// Shared by <see cref="Execute"/> and <see cref="ExecuteVisualFind"/> so a FindImage/
+    /// FindText click-on-found goes through the identical backend resolution (real input,
+    /// background messages, or UI Automation) as an ordinary click.
+    /// </summary>
+    private void DispatchClick(SeqAction a, int x, int y, int method)
+    {
+        if (method == 2)
+        {
+            // Soft failure by design: TryInvokeAt returns false when there's simply no
+            // invokable element under the point (or COM misbehaved), which is not a
+            // reason to abort the run -- the action was still attempted, so it counts
+            // as performed either way. DoubleClick/Button/HoldMs are ignored here: an
+            // invoke activates a control rather than synthesizing a physical click, so a
+            // user who set "right double-click + UIA" would otherwise be quietly
+            // surprised that none of that took effect.
+            UiaInvoker.TryInvokeAt(x, y, out _);
+        }
+        // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
+        // panic key wait out the whole hold before taking effect.
+        else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+        else { MoveToOrFail(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
+    }
+
+    /// <summary>
+    /// The wait-and-resolve loop behind <see cref="ActionKind.FindImage"/> and
+    /// <see cref="ActionKind.FindText"/>. Captures the search region, runs the lookup, and on
+    /// success stores the found center into the run-scoped variables <c>found.x</c>/
+    /// <c>found.y</c>/<c>found.score</c> (readable by later SetVar/IfElse steps) and optionally
+    /// clicks it. On timeout it mirrors <see cref="ActionKind.WaitPixel"/>: abort the run when
+    /// <see cref="SeqAction.AbortRunOnTimeout"/> is set, otherwise report not-performed like a
+    /// failed gate.
+    /// </summary>
+    private bool ExecuteVisualFind(SeqAction a, bool background, int jitterPx, ref POINT lastTarget, RunContext ctx)
+    {
+        // Decode the template once, before the wait, so a corrupt PNG fails immediately
+        // instead of after the whole timeout has elapsed.
+        using Bitmap? template = a.Kind == ActionKind.FindImage ? DecodeTemplate(a.TemplatePng) : null;
+
+        Rectangle region = ResolveSearchRegion(a);
+        var sw = Stopwatch.StartNew();
+
+        while (keepGoing())
+        {
+            Point? found = null;
+            double score = 0;
+            using (Bitmap screen = ImageMatcher.CaptureRegion(region))
+            {
+                if (a.Kind == ActionKind.FindImage)
+                {
+                    if (ImageMatcher.TryFind(screen, template!, a.MatchThreshold, out Point topLeft, out score))
+                        found = topLeft;
+                }
+                else if (OcrTextReader.TryFind(screen, a.TextQuery, a.RegexQuery, out Rectangle box, out score))
+                {
+                    // OCR returns the matched word/line box; the runner works in centers.
+                    found = new Point(box.X + box.Width / 2, box.Y + box.Height / 2);
+                }
+            }
+
+            if (found is Point p)
+            {
+                // found.x/y are the raw found center (no offset or jitter), so a later
+                // SetVar/IfElse can reason about where the target actually was.
+                ctx.Variables["found.x"] = VarValue.FromNumber(p.X);
+                ctx.Variables["found.y"] = VarValue.FromNumber(p.Y);
+                ctx.Variables["found.score"] = VarValue.FromNumber(score);
+
+                if (a.ClickOnFound)
+                {
+                    int cx = p.X + a.ClickOffsetX;
+                    int cy = p.Y + a.ClickOffsetY;
+                    if (jitterPx > 0) { cx += JitterPx(jitterPx); cy += JitterPx(jitterPx); }
+                    lastTarget = new POINT { X = cx, Y = cy };
+                    DispatchClick(a, cx, cy, ResolveClickMethod(a.ClickMethod, background));
+                }
+                return true;
+            }
+
+            if (a.PixelTimeoutMs > 0 && sw.ElapsedMilliseconds >= a.PixelTimeoutMs)
+            {
+                if (a.AbortRunOnTimeout)
+                {
+                    string what = a.Kind == ActionKind.FindImage
+                        ? "the image"
+                        : $"text \"{a.TextQuery}\"";
+                    throw new InvalidOperationException($"Timed out finding {what} in {a.DescribeSearchRegion()}.");
+                }
+                return false; // not performed, like a failed gate
+            }
+
+            Thread.Sleep(Math.Max(a.PollIntervalMs, 10));
+        }
+
+        return false; // stopped mid-wait
+    }
+
+    private static Bitmap DecodeTemplate(byte[]? png)
+    {
+        if (png is null || png.Length == 0)
+            throw new InvalidOperationException("FindImage has no template image — capture or load one in the editor.");
+        try
+        {
+            return new Bitmap(new MemoryStream(png));
+        }
+        catch (Exception ex) when (ex is ArgumentException or System.IO.IOException)
+        {
+            throw new InvalidOperationException("The FindImage template is not a readable image: " + ex.Message);
+        }
+    }
+
+    private static Rectangle ResolveSearchRegion(SeqAction a) =>
+        a.SearchW <= 0 || a.SearchH <= 0
+            ? SystemInformation.VirtualScreen
+            : new Rectangle(a.SearchX, a.SearchY, a.SearchW, a.SearchH);
 
     /// <summary>
     /// Picks the backend for a positioned action. A per-action <see cref="SeqAction.ClickMethod"/>

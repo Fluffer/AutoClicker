@@ -2,7 +2,11 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- net10.0-windows10.0.17763.0 (rather than plain net10.0-windows) unlocks the WinRT
+         projections: Windows.Media.Ocr (FindText), Windows.Graphics.Imaging and
+         Windows.Storage.Streams (Bitmap -> SoftwareBitmap), and later Windows.Graphics.Capture.
+         17763 matches packaging\AppxManifest.xml's MinVersion exactly. -->
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>

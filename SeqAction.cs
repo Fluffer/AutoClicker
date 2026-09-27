@@ -21,6 +21,10 @@ public enum ActionKind
     Break = 11,
     GotoLabel = 12,
     Label = 13,
+    // Visual targeting. Values 14-15 must stay stable: FormatVersion 3 files rely on their
+    // exact numeric meanings.
+    FindImage = 14,
+    FindText = 15,
 }
 
 /// <summary>
@@ -111,7 +115,10 @@ public sealed class SeqAction
     /// A gate is IGNORED on control-flow kinds (<see cref="ActionKind.Repeat"/>, EndBlock,
     /// IfElse, SetVar, Break, GotoLabel, Label): they don't perform input, so there is
     /// nothing for a pixel colour to gate, and a "closed" loop header would silently skip
-    /// its whole block instead of the one action a gate is meant to suppress.
+    /// its whole block instead of the one action a gate is meant to suppress. It is also
+    /// ignored on the wait kinds <see cref="ActionKind.FindImage"/>/<see cref="ActionKind.FindText"/>,
+    /// which — like <see cref="ActionKind.WaitPixel"/> — already have their own success
+    /// criterion (the template/text appearing) and use the wait fields instead.
     /// </remarks>
     public PixelCondition Condition { get; set; } = PixelCondition.None;
 
@@ -128,13 +135,16 @@ public sealed class SeqAction
     /// <summary>Maximum allowed per-channel delta (0-255) for a color to still "match".</summary>
     public int CondTolerance { get; set; } = 10;
 
-    /// <summary><see cref="ActionKind.WaitPixel"/> only: give up after this long. 0 waits indefinitely.</summary>
+    /// <summary>
+    /// Wait kinds (<see cref="ActionKind.WaitPixel"/>/<see cref="ActionKind.FindImage"/>/
+    /// <see cref="ActionKind.FindText"/>): give up after this long. 0 waits indefinitely.
+    /// </summary>
     public int PixelTimeoutMs { get; set; }
 
-    /// <summary><see cref="ActionKind.WaitPixel"/> only: abort the whole run if the wait times out.</summary>
+    /// <summary>Wait kinds: abort the whole run if the wait times out.</summary>
     public bool AbortRunOnTimeout { get; set; }
 
-    /// <summary><see cref="ActionKind.WaitPixel"/> only: how often to re-sample while waiting.</summary>
+    /// <summary>Wait kinds: how often to re-sample/re-capture while waiting.</summary>
     public int PollIntervalMs { get; set; } = 50;
 
     // ---- Control flow ----
@@ -160,6 +170,42 @@ public sealed class SeqAction
 
     /// <summary><see cref="ActionKind.GotoLabel"/>/<see cref="ActionKind.Label"/> only: the label name.</summary>
     public string Label { get; set; } = "";
+
+    // ---- Visual targeting (FindImage / FindText) ----
+
+    /// <summary><see cref="ActionKind.FindImage"/> only: the template, PNG-encoded.</summary>
+    /// <remarks>Serialized as base64 in JSON (<see cref="System.Text.Json"/> handles byte arrays automatically).</remarks>
+    public byte[]? TemplatePng { get; set; }
+
+    /// <summary><see cref="ActionKind.FindImage"/> only: minimum similarity (0..1) to count as found.</summary>
+    public double MatchThreshold { get; set; } = 0.85;
+
+    /// <summary>
+    /// <see cref="ActionKind.FindImage"/>/<see cref="ActionKind.FindText"/>: the search rectangle
+    /// in screen coordinates. Width/height 0 mean the full virtual screen.
+    /// </summary>
+    public int SearchX { get; set; }
+    public int SearchY { get; set; }
+    public int SearchW { get; set; }
+    public int SearchH { get; set; }
+
+    /// <summary>
+    /// <see cref="ActionKind.FindImage"/>/<see cref="ActionKind.FindText"/>: click the found
+    /// target's center once it is located. The click shares this action's
+    /// <see cref="Button"/>/<see cref="DoubleClick"/>/<see cref="HoldMs"/>/<see cref="ClickMethod"/>
+    /// semantics; when false the action only resolves and stores the location for later steps.
+    /// </summary>
+    public bool ClickOnFound { get; set; }
+
+    /// <summary><see cref="ActionKind.FindImage"/>/<see cref="ActionKind.FindText"/>: added to the found center before clicking.</summary>
+    public int ClickOffsetX { get; set; }
+    public int ClickOffsetY { get; set; }
+
+    /// <summary><see cref="ActionKind.FindText"/> only: the text to look for, matched case-insensitively.</summary>
+    public string TextQuery { get; set; } = "";
+
+    /// <summary><see cref="ActionKind.FindText"/> only: treat <see cref="TextQuery"/> as a regular expression.</summary>
+    public bool RegexQuery { get; set; }
 
     /// <summary>Wait AFTER this action, before the next one.</summary>
     public int DelayMs { get; set; }
@@ -198,6 +244,14 @@ public sealed class SeqAction
         VarName ??= "";
         ValueExpr ??= "";
         Label ??= "";
+        MatchThreshold = double.IsNaN(MatchThreshold) ? 0.85 : Math.Clamp(MatchThreshold, 0.0, 1.0);
+        SearchX = Math.Clamp(SearchX, -100000, 100000);
+        SearchY = Math.Clamp(SearchY, -100000, 100000);
+        SearchW = Math.Clamp(SearchW, 0, 100000);
+        SearchH = Math.Clamp(SearchH, 0, 100000);
+        ClickOffsetX = Math.Clamp(ClickOffsetX, -100000, 100000);
+        ClickOffsetY = Math.Clamp(ClickOffsetY, -100000, 100000);
+        TextQuery ??= "";
     }
 
     public string ButtonName => Button switch { 1 => "Right", 2 => "Middle", _ => "Left" };
@@ -234,10 +288,12 @@ public sealed class SeqAction
             ActionKind.Break => "Break",
             ActionKind.GotoLabel => $"Goto {Label}",
             ActionKind.Label => $"Label {Label}",
+            ActionKind.FindImage => $"Find image ({Percent(MatchThreshold)}){(ClickOnFound ? " → click" : "")}",
+            ActionKind.FindText => $"Find text \"{Ellipsis(SingleLine(TextQuery), 32)}\"{(ClickOnFound ? " → click" : "")}",
             _ => Kind.ToString(),
         };
 
-        if (Kind == ActionKind.WaitPixel || IsControlKind(Kind) || Condition == PixelCondition.None) return baseDesc;
+        if (IsWaitKind(Kind) || IsControlKind(Kind) || Condition == PixelCondition.None) return baseDesc;
 
         string suffix = Condition == PixelCondition.IfMatch
             ? $"if {DescribeColor()} at {CondX},{CondY}"
@@ -250,6 +306,9 @@ public sealed class SeqAction
     {
         // WaitPixel has no click target of its own; show the pixel it samples instead.
         if (Kind == ActionKind.WaitPixel) return string.Create(CultureInfo.InvariantCulture, $"{CondX}, {CondY}");
+        // FindImage targets a region; FindText targets a query string.
+        if (Kind == ActionKind.FindImage) return DescribeSearchRegion();
+        if (Kind == ActionKind.FindText) return Ellipsis(TextQuery, 32);
         if (Kind is ActionKind.Key or ActionKind.Text or ActionKind.Wait || IsControlKind(Kind)) return "—";
         string pos = string.Create(CultureInfo.InvariantCulture, $"{X}, {Y}");
         return WindowRelative ? $"{pos} in {Ellipsis(WindowLabel, 24)}" : pos;
@@ -267,8 +326,26 @@ public sealed class SeqAction
         ActionKind.Repeat or ActionKind.EndBlock or ActionKind.IfElse or ActionKind.SetVar
         or ActionKind.Break or ActionKind.GotoLabel or ActionKind.Label;
 
+    /// <summary>
+    /// True for the kinds whose own success criterion replaces a pixel gate: each waits for
+    /// something on screen (a colour, a template, some text) and has nothing else to gate.
+    /// </summary>
+    internal static bool IsWaitKind(ActionKind kind) => kind is
+        ActionKind.WaitPixel or ActionKind.FindImage or ActionKind.FindText;
+
+    /// <summary>The search rectangle as a compact list/error string.</summary>
+    internal string DescribeSearchRegion() =>
+        SearchW <= 0 || SearchH <= 0
+            ? "full screen"
+            : string.Create(CultureInfo.InvariantCulture, $"{SearchW}×{SearchH} at {SearchX}, {SearchY}");
+
     private static string Ellipsis(string s, int max) =>
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max - 1), "…");
+
+    /// <summary>0.85 → "85%".</summary>
+    private static string Percent(double value) =>
+        string.Create(CultureInfo.InvariantCulture, $"{(int)Math.Round(value * 100)}%");
+
 
     /// <summary>A ListView subitem can't show line breaks, so make them visible instead.</summary>
     private static string SingleLine(string s) =>

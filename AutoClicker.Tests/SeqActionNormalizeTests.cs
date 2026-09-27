@@ -89,4 +89,40 @@ public class SeqActionNormalizeTests
         Assert.Equal("", a.ValueExpr);
         Assert.Equal("", a.Label);
     }
+
+    [Fact]
+    public void FindImage_and_FindText_fields_are_normalized()
+    {
+        var a = new SeqAction
+        {
+            Kind = ActionKind.FindImage,
+            MatchThreshold = 7.5,       // > 1
+            SearchX = -999999,
+            SearchY = 999999,
+            SearchW = -4,
+            SearchH = 999999,
+            ClickOffsetX = -999999,
+            ClickOffsetY = 999999,
+            TextQuery = null!,
+        };
+        a.Normalize();
+
+        Assert.Equal(1.0, a.MatchThreshold);
+        Assert.Equal(-100000, a.SearchX);
+        Assert.Equal(100000, a.SearchY);
+        Assert.Equal(0, a.SearchW);
+        Assert.Equal(100000, a.SearchH);
+        Assert.Equal(-100000, a.ClickOffsetX);
+        Assert.Equal(100000, a.ClickOffsetY);
+        Assert.Equal("", a.TextQuery);
+
+        // A negative threshold clamps to 0, and a NaN (a hand-corrupted file) snaps back to the default.
+        var neg = new SeqAction { MatchThreshold = -1 };
+        neg.Normalize();
+        Assert.Equal(0.0, neg.MatchThreshold);
+
+        var nan = new SeqAction { MatchThreshold = double.NaN };
+        nan.Normalize();
+        Assert.Equal(0.85, nan.MatchThreshold);
+    }
 }

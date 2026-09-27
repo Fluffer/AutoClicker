@@ -108,12 +108,62 @@ public class SequenceFileTests
     }
 
     [Fact]
-    public void Format_version_3_is_refused()
+    public void Format_version_4_is_refused()
     {
-        const string future = """{"FormatVersion":3,"Actions":[{"Kind":7}]}""";
+        const string future = """{"FormatVersion":4,"Actions":[{"Kind":7}]}""";
         var ex = Assert.Throws<SequenceFile.UnsupportedVersionException>(
             () => SequenceFile.Deserialize(future));
-        Assert.Contains("3", ex.Message);
+        Assert.Contains("4", ex.Message);
+    }
+
+    [Fact]
+    public void Format_version_3_file_loads_visual_targeting_kinds()
+    {
+        const string v3 = """{"FormatVersion":3,"Actions":[{"Kind":14,"MatchThreshold":0.9},{"Kind":15,"TextQuery":"Submit"}]}""";
+        var actions = SequenceFile.Deserialize(v3);
+        Assert.Equal(2, actions.Count);
+        Assert.Equal(ActionKind.FindImage, actions[0].Kind);
+        Assert.Equal(0.9, actions[0].MatchThreshold);
+        Assert.Equal(ActionKind.FindText, actions[1].Kind);
+        Assert.Equal("Submit", actions[1].TextQuery);
+    }
+
+    [Fact]
+    public void Round_trip_preserves_FindImage_and_FindText_fields()
+    {
+        byte[] png = [1, 2, 3, 4, 5, 6, 7, 8];
+        var original = new List<SeqAction>
+        {
+            new()
+            {
+                Kind = ActionKind.FindImage,
+                TemplatePng = png,
+                MatchThreshold = 0.9,
+                SearchX = 1, SearchY = 2, SearchW = 300, SearchH = 200,
+                ClickOnFound = true, ClickOffsetX = 5, ClickOffsetY = -3,
+            },
+            new() { Kind = ActionKind.FindText, TextQuery = "Submit", RegexQuery = true, ClickOnFound = false },
+        };
+
+        string json = SequenceFile.Serialize(original);
+        var back = SequenceFile.Deserialize(json);
+
+        Assert.Equal(2, back.Count);
+        Assert.Equal(ActionKind.FindImage, back[0].Kind);
+        Assert.Equal(png, back[0].TemplatePng);
+        Assert.Equal(0.9, back[0].MatchThreshold);
+        Assert.Equal(1, back[0].SearchX);
+        Assert.Equal(2, back[0].SearchY);
+        Assert.Equal(300, back[0].SearchW);
+        Assert.Equal(200, back[0].SearchH);
+        Assert.True(back[0].ClickOnFound);
+        Assert.Equal(5, back[0].ClickOffsetX);
+        Assert.Equal(-3, back[0].ClickOffsetY);
+
+        Assert.Equal(ActionKind.FindText, back[1].Kind);
+        Assert.Equal("Submit", back[1].TextQuery);
+        Assert.True(back[1].RegexQuery);
+        Assert.False(back[1].ClickOnFound);
     }
 
     [Fact]
