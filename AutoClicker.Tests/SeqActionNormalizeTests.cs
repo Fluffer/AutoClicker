@@ -69,4 +69,24 @@ public class SeqActionNormalizeTests
         Assert.Equal(10, a.X);
         Assert.Equal("Ctrl+C", a.KeyCombo);
     }
+
+    [Fact]
+    public void Control_flow_fields_are_normalized()
+    {
+        var a = new SeqAction
+        {
+            Kind = ActionKind.Repeat,
+            RepeatCount = -3,
+            ConditionExpr = null!,
+            VarName = null!,
+            ValueExpr = null!,
+            Label = null!,
+        };
+        a.Normalize();
+        Assert.Equal(0, a.RepeatCount);
+        Assert.Equal("", a.ConditionExpr);
+        Assert.Equal("", a.VarName);
+        Assert.Equal("", a.ValueExpr);
+        Assert.Equal("", a.Label);
+    }
 }

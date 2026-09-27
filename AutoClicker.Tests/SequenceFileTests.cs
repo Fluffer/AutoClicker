@@ -85,4 +85,63 @@ public class SequenceFileTests
         Assert.Equal(0, actions[0].DelayMs);
         Assert.Equal(10, actions[0].PollIntervalMs);
     }
+
+    [Fact]
+    public void Format_version_1_envelope_still_loads()
+    {
+        const string v1 = """{"FormatVersion":1,"Actions":[{"Kind":0,"X":4,"Y":5}]}""";
+        var actions = SequenceFile.Deserialize(v1);
+        Assert.Single(actions);
+        Assert.Equal(ActionKind.Click, actions[0].Kind);
+        Assert.Equal(4, actions[0].X);
+    }
+
+    [Fact]
+    public void Format_version_2_file_loads_control_flow_kinds()
+    {
+        const string v2 = """{"FormatVersion":2,"Actions":[{"Kind":7,"RepeatCount":3},{"Kind":11}]}""";
+        var actions = SequenceFile.Deserialize(v2);
+        Assert.Equal(2, actions.Count);
+        Assert.Equal(ActionKind.Repeat, actions[0].Kind);
+        Assert.Equal(3, actions[0].RepeatCount);
+        Assert.Equal(ActionKind.Break, actions[1].Kind);
+    }
+
+    [Fact]
+    public void Format_version_3_is_refused()
+    {
+        const string future = """{"FormatVersion":3,"Actions":[{"Kind":7}]}""";
+        var ex = Assert.Throws<SequenceFile.UnsupportedVersionException>(
+            () => SequenceFile.Deserialize(future));
+        Assert.Contains("3", ex.Message);
+    }
+
+    [Fact]
+    public void Round_trip_preserves_every_control_flow_kind()
+    {
+        var original = new List<SeqAction>
+        {
+            new() { Kind = ActionKind.Repeat, RepeatCount = 5 },
+            new() { Kind = ActionKind.SetVar, VarName = "counter", ValueExpr = "counter + 1" },
+            new() { Kind = ActionKind.IfElse, ConditionExpr = "counter < 5" },
+            new() { Kind = ActionKind.Break },
+            new() { Kind = ActionKind.EndBlock },
+            new() { Kind = ActionKind.GotoLabel, Label = "farm" },
+            new() { Kind = ActionKind.Label, Label = "farm" },
+        };
+
+        string json = SequenceFile.Serialize(original);
+        var back = SequenceFile.Deserialize(json);
+
+        Assert.Equal(original.Count, back.Count);
+        for (int i = 0; i < original.Count; i++)
+        {
+            Assert.Equal(original[i].Kind, back[i].Kind);
+            Assert.Equal(original[i].RepeatCount, back[i].RepeatCount);
+            Assert.Equal(original[i].VarName, back[i].VarName);
+            Assert.Equal(original[i].ValueExpr, back[i].ValueExpr);
+            Assert.Equal(original[i].ConditionExpr, back[i].ConditionExpr);
+            Assert.Equal(original[i].Label, back[i].Label);
+        }
+    }
 }

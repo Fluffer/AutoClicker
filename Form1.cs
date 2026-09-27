@@ -664,7 +664,7 @@ public partial class Form1 : Form
         seed.X = cur.X;
         seed.Y = cur.Y;
 
-        using var dlg = new ActionEditorForm(seed, "Add action");
+        using var dlg = new ActionEditorForm(seed, "Add action", points);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         points.Add(dlg.Result);
@@ -698,11 +698,14 @@ public partial class Form1 : Form
     {
         lvPoints.BeginUpdate();
         lvPoints.Items.Clear();
+        // Block depth is recomputed after every mutation (add/edit/remove/move/load), so
+        // the indent guides always reflect the current structure.
+        int[] depth = ControlFlow.BuildDepth(points);
         for (int i = 0; i < points.Count; i++)
         {
             var p = points[i];
             var item = new ListViewItem((i + 1).ToString(CultureInfo.InvariantCulture));
-            item.SubItems.Add(p.Describe());
+            item.SubItems.Add(IndentGuide(depth[i]) + p.Describe());
             item.SubItems.Add(p.DescribeTarget());
             item.SubItems.Add(p.DelayMs.ToString(CultureInfo.InvariantCulture));
             lvPoints.Items.Add(item);
@@ -710,13 +713,17 @@ public partial class Form1 : Form
         lvPoints.EndUpdate();
     }
 
+    // ListView subitems can't be indented with ListViewItem.Indent (that shifts only the
+    // first column), so the Action column gets text indent guides instead.
+    private static string IndentGuide(int depth) => depth <= 0 ? "" : new string(' ', depth * 2) + "↳ ";
+
     // ---- Edit an action ----
     private void EditSelectedPoint()
     {
         int i = SelectedIndex();
         if (i < 0) { lblStatus.Text = "Select an action first, then Edit."; return; }
 
-        using var dlg = new ActionEditorForm(points[i], $"Edit action #{i + 1}");
+        using var dlg = new ActionEditorForm(points[i], $"Edit action #{i + 1}", points);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
         points[i] = dlg.Result;

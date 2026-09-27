@@ -9,6 +9,7 @@ namespace AutoClicker;
 internal sealed class ActionEditorForm : Form
 {
     private readonly SeqAction action;
+    private readonly List<SeqAction>? sequence;
 
     private readonly ComboBox cmbKind = NewCombo(150);
     private readonly NumericUpDown numX = NewNum(-100000, 100000);
@@ -48,6 +49,16 @@ internal sealed class ActionEditorForm : Form
     private readonly CheckBox chkAbortOnTimeout = new() { Text = "Stop the whole run if it times out", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
     private readonly NumericUpDown numPollInterval = NewNum(10, 60000);
 
+    // ---- Control flow ----
+    private readonly NumericUpDown numRepeatCount = NewNum(0, 1_000_000);
+    private readonly Label lblRepeatHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+    private readonly TextBox txtCondition = new() { Width = 260, Margin = new Padding(3, 4, 3, 3) };
+    private readonly Label lblConditionHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+    private readonly TextBox txtVarName = new() { Width = 200, Margin = new Padding(3, 4, 3, 3) };
+    private readonly TextBox txtValueExpr = new() { Width = 260, Margin = new Padding(3, 4, 3, 3) };
+    private readonly Label lblVarHint = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) };
+    private readonly ComboBox cmbLabel = new() { DropDownStyle = ComboBoxStyle.DropDown, Width = 200, Margin = new Padding(3, 4, 3, 3) };
+
     private readonly List<(Control label, Control field, Func<ActionKind, bool> visibleFor)> rows = new();
     private readonly Button btnOk;
 
@@ -66,9 +77,10 @@ internal sealed class ActionEditorForm : Form
 
     public SeqAction Result => action;
 
-    public ActionEditorForm(SeqAction source, string title)
+    public ActionEditorForm(SeqAction source, string title, List<SeqAction>? sequence = null)
     {
         action = source.Clone();
+        this.sequence = sequence;
         anchorClass = action.WindowClass;
         anchorTitle = action.WindowTitle;
 
@@ -95,7 +107,12 @@ internal sealed class ActionEditorForm : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         Controls.Add(root);
 
-        cmbKind.Items.AddRange(new object[] { "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only", "Wait for pixel" });
+        cmbKind.Items.AddRange(new object[]
+        {
+            "Click", "Drag", "Scroll", "Key press", "Type text", "Wait only", "Wait for pixel",
+            "Repeat (loop)", "End block", "If (conditional)", "Set variable", "Break loop",
+            "Goto label", "Label",
+        });
         cmbKind.SelectedIndex = (int)action.Kind;
         cmbKind.SelectedIndexChanged += (_, _) =>
         {
@@ -149,16 +166,27 @@ internal sealed class ActionEditorForm : Form
         AddRow(root, "", lblComboHint, k => k is ActionKind.Key);
         AddRow(root, "Text:", txtText, k => k is ActionKind.Text);
 
-        // Pixel condition rows apply to every kind: any action can be gated on a pixel
-        // colour, and a WaitPixel action IS the wait built from these same fields.
-        AddRow(root, "Pixel condition:", cmbCondition, _ => true);
-        AddRow(root, "Pixel point  X", condPosFlow, _ => true);
-        AddRow(root, "Pixel color:", swatchFlow, _ => true);
-        AddRow(root, "Tolerance:", numTolerance, _ => true);
-        AddRow(root, "", lblToleranceHint, _ => true);
+        // Pixel condition rows apply to every input kind: any action can be gated on a pixel
+        // colour, and a WaitPixel action IS the wait built from these same fields. Control-flow
+        // kinds ignore gates entirely, so the rows hide for them (a gate there would do nothing).
+        AddRow(root, "Pixel condition:", cmbCondition, k => !SeqAction.IsControlKind(k));
+        AddRow(root, "Pixel point  X", condPosFlow, k => !SeqAction.IsControlKind(k));
+        AddRow(root, "Pixel color:", swatchFlow, k => !SeqAction.IsControlKind(k));
+        AddRow(root, "Tolerance:", numTolerance, k => !SeqAction.IsControlKind(k));
+        AddRow(root, "", lblToleranceHint, k => !SeqAction.IsControlKind(k));
         AddRow(root, "Wait timeout (ms, 0 = forever):", numPixelTimeout, k => k == ActionKind.WaitPixel);
         AddRow(root, "", chkAbortOnTimeout, k => k == ActionKind.WaitPixel);
         AddRow(root, "Check every (ms):", numPollInterval, k => k == ActionKind.WaitPixel);
+
+        // Control-flow rows: each new kind shows only the fields it uses.
+        AddRow(root, "Repeat count:", numRepeatCount, k => k == ActionKind.Repeat);
+        AddRow(root, "", lblRepeatHint, k => k == ActionKind.Repeat);
+        AddRow(root, "Condition:", txtCondition, k => k == ActionKind.IfElse);
+        AddRow(root, "", lblConditionHint, k => k == ActionKind.IfElse);
+        AddRow(root, "Variable name:", txtVarName, k => k == ActionKind.SetVar);
+        AddRow(root, "Value:", txtValueExpr, k => k == ActionKind.SetVar);
+        AddRow(root, "", lblVarHint, k => k == ActionKind.SetVar);
+        AddRow(root, "Label:", cmbLabel, k => k is ActionKind.GotoLabel or ActionKind.Label);
 
         AddRow(root, "Wait after (ms):", numDelay, _ => true);
 
@@ -191,6 +219,16 @@ internal sealed class ActionEditorForm : Form
         numPixelTimeout.Value = Math.Clamp(action.PixelTimeoutMs, numPixelTimeout.Minimum, numPixelTimeout.Maximum);
         chkAbortOnTimeout.Checked = action.AbortRunOnTimeout;
         numPollInterval.Value = action.PollIntervalMs;
+
+        numRepeatCount.Value = Math.Clamp(action.RepeatCount, numRepeatCount.Minimum, numRepeatCount.Maximum);
+        lblRepeatHint.Text = "0 = loop until Break.";
+        txtCondition.Text = action.ConditionExpr;
+        lblConditionHint.Text = "e.g. counter < 5";
+        txtVarName.Text = action.VarName;
+        txtValueExpr.Text = action.ValueExpr;
+        lblVarHint.Text = "e.g. counter = counter + 1";
+        PopulateLabels();
+        cmbLabel.Text = action.Label;
 
         chkAnchor.CheckedChanged += (_, _) => AnchorToggled();
         cmbClickMethod.SelectedIndexChanged += (_, _) => UpdateClickMethodHint();
@@ -480,6 +518,35 @@ internal sealed class ActionEditorForm : Form
 
     // ---- Validation ----
 
+    /// <summary>
+    /// Fills the label combo with the labels already present in the sequence, so a Goto can
+    /// pick its target from the list instead of retyping it. The combo stays editable, so a
+    /// brand-new label (or a sequence-less caller) is still free text.
+    /// </summary>
+    private void PopulateLabels()
+    {
+        string keep = cmbLabel.Text;
+        cmbLabel.Items.Clear();
+        if (sequence is not null)
+        {
+            foreach (SeqAction a in sequence)
+            {
+                if (a.Kind != ActionKind.Label) continue;
+                string label = a.Label?.Trim() ?? "";
+                if (label.Length > 0 && !cmbLabel.Items.Contains(label)) cmbLabel.Items.Add(label);
+            }
+        }
+        cmbLabel.Text = keep;
+    }
+
+    private static bool IsValidIdentifier(string name)
+    {
+        if (name.Length == 0 || char.IsDigit(name[0])) return false;
+        foreach (char c in name)
+            if (!char.IsLetterOrDigit(c) && c != '_') return false;
+        return true;
+    }
+
     private void ValidateCombo()
     {
         if (SelectedKind != ActionKind.Key) { lblComboHint.Text = ""; return; }
@@ -512,6 +579,41 @@ internal sealed class ActionEditorForm : Form
             e.Cancel = true;
             return;
         }
+        if (kind == ActionKind.IfElse && txtCondition.Text.Trim().Length == 0)
+        {
+            MessageBox.Show(this, "Type a condition, e.g. counter < 5.", "Empty condition", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = true;
+            return;
+        }
+        if (kind == ActionKind.SetVar)
+        {
+            string name = txtVarName.Text.Trim();
+            if (name.Length == 0)
+            {
+                MessageBox.Show(this, "Name the variable to set.", "Empty variable name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+            if (!IsValidIdentifier(name))
+            {
+                MessageBox.Show(this, "Variable names can only use letters, digits and underscores, and can't start with a digit.",
+                    "Invalid variable name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+            if (txtValueExpr.Text.Trim().Length == 0)
+            {
+                MessageBox.Show(this, "Type a value, e.g. counter + 1.", "Empty value", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+        }
+        if (kind is ActionKind.GotoLabel or ActionKind.Label && cmbLabel.Text.Trim().Length == 0)
+        {
+            MessageBox.Show(this, "Name the label.", "Empty label", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            e.Cancel = true;
+            return;
+        }
 
         action.Kind = kind;
         action.X = (int)numX.Value;
@@ -539,6 +641,11 @@ internal sealed class ActionEditorForm : Form
         action.PixelTimeoutMs = (int)numPixelTimeout.Value;
         action.AbortRunOnTimeout = chkAbortOnTimeout.Checked;
         action.PollIntervalMs = (int)numPollInterval.Value;
+        action.RepeatCount = (int)numRepeatCount.Value;
+        action.ConditionExpr = txtCondition.Text.Trim();
+        action.VarName = txtVarName.Text.Trim();
+        action.ValueExpr = txtValueExpr.Text.Trim();
+        action.Label = cmbLabel.Text.Trim();
         action.Normalize();
     }
 

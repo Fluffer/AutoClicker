@@ -13,7 +13,11 @@ namespace AutoClicker;
 /// <list type="bullet">
 /// <item>Legacy files (a bare JSON array of actions) load as format 1 — that is what
 /// every version up to 1.1.0 wrote, and they must keep loading forever.</item>
-/// <item>Current files are an envelope: <c>{"FormatVersion":1,"Actions":[...]}</c>.</item>
+/// <item>Format 1 envelopes (<c>{"FormatVersion":1,"Actions":[...]}</c>) also still load:
+/// they never contain control-flow kinds (7-13), which only exist since format 2.</item>
+/// <item>Current files are format 2: <c>{"FormatVersion":2,"Actions":[...]}</c>, which may
+/// contain the control-flow kinds. A format-2 file opened in an older build is refused
+/// (see <see cref="UnsupportedVersionException"/>) before any unknown kind can collapse.</item>
 /// <item>A file declaring a <b>higher</b> FormatVersion than this build knows is refused
 /// with a clear message instead of being reinterpreted.</item>
 /// </list>
@@ -21,7 +25,7 @@ namespace AutoClicker;
 internal static class SequenceFile
 {
     /// <summary>The newest format version this build reads and writes.</summary>
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 

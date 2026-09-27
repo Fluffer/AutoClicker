@@ -220,15 +220,15 @@ internal static class CliRunner
         };
 
         int performedCount = 0;
-        int stepCount = 0;
+        int passCount = 0;
         var runner = new SequenceRunner(
             keepGoing: () => !stopRequested,
             onStep: (idx, performed) =>
             {
                 if (idx < 0) return; // end-of-run marker, not a step
-                stepCount++;
                 if (performed) performedCount++;
-            });
+            },
+            onPassComplete: () => passCount++);
 
         var stopwatch = Stopwatch.StartNew();
         try
@@ -242,9 +242,8 @@ internal static class CliRunner
         }
         stopwatch.Stop();
 
-        int passesCompleted = stepCount / actions.Count;
         Console.WriteLine(FormattableString.Invariant(
-            $"Done: {performedCount} action(s) performed, {passesCompleted} pass(es) completed, elapsed {stopwatch.Elapsed:mm\\:ss\\.fff}."));
+            $"Done: {performedCount} action(s) performed, {passCount} pass(es) completed, elapsed {stopwatch.Elapsed:mm\\:ss\\.fff}."));
         return ExitSuccess;
     }
 

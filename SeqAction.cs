@@ -12,6 +12,15 @@ public enum ActionKind
     Text = 4,
     Wait = 5,
     WaitPixel = 6,
+    // Control flow. Values 7-13 must stay stable: FormatVersion 1 files never contain
+    // them, and FormatVersion 2 files rely on their exact numeric meanings.
+    Repeat = 7,
+    EndBlock = 8,
+    IfElse = 9,
+    SetVar = 10,
+    Break = 11,
+    GotoLabel = 12,
+    Label = 13,
 }
 
 /// <summary>
@@ -98,6 +107,12 @@ public sealed class SeqAction
     /// stops matching. A <see cref="ActionKind.WaitPixel"/> left at <see cref="PixelCondition.None"/>
     /// has nothing to wait for and the engine should treat it as a no-op.
     /// </summary>
+    /// <remarks>
+    /// A gate is IGNORED on control-flow kinds (<see cref="ActionKind.Repeat"/>, EndBlock,
+    /// IfElse, SetVar, Break, GotoLabel, Label): they don't perform input, so there is
+    /// nothing for a pixel colour to gate, and a "closed" loop header would silently skip
+    /// its whole block instead of the one action a gate is meant to suppress.
+    /// </remarks>
     public PixelCondition Condition { get; set; } = PixelCondition.None;
 
     /// <summary>
@@ -121,6 +136,30 @@ public sealed class SeqAction
 
     /// <summary><see cref="ActionKind.WaitPixel"/> only: how often to re-sample while waiting.</summary>
     public int PollIntervalMs { get; set; } = 50;
+
+    // ---- Control flow ----
+    /// <summary>
+    /// <see cref="ActionKind.Repeat"/> only: how many times to run the block this header
+    /// opens. 0 means "until <see cref="ActionKind.Break"/> (or the run is stopped)".
+    /// </summary>
+    public int RepeatCount { get; set; } = 1;
+
+    /// <summary>
+    /// <see cref="ActionKind.IfElse"/> only: the condition expression, evaluated by the
+    /// expression engine. When it is false the block is skipped past its EndBlock.
+    /// There is deliberately no Else branch — write two IfElse blocks with inverted
+    /// conditions instead.
+    /// </summary>
+    public string ConditionExpr { get; set; } = "";
+
+    /// <summary><see cref="ActionKind.SetVar"/> only: the variable to assign.</summary>
+    public string VarName { get; set; } = "";
+
+    /// <summary><see cref="ActionKind.SetVar"/> only: the value expression to evaluate and store.</summary>
+    public string ValueExpr { get; set; } = "";
+
+    /// <summary><see cref="ActionKind.GotoLabel"/>/<see cref="ActionKind.Label"/> only: the label name.</summary>
+    public string Label { get; set; } = "";
 
     /// <summary>Wait AFTER this action, before the next one.</summary>
     public int DelayMs { get; set; }
@@ -154,6 +193,11 @@ public sealed class SeqAction
         CondTolerance = Math.Clamp(CondTolerance, 0, 255);
         PixelTimeoutMs = Math.Max(0, PixelTimeoutMs);
         PollIntervalMs = Math.Clamp(PollIntervalMs, 10, 60000);
+        RepeatCount = Math.Max(0, RepeatCount);
+        ConditionExpr ??= "";
+        VarName ??= "";
+        ValueExpr ??= "";
+        Label ??= "";
     }
 
     public string ButtonName => Button switch { 1 => "Right", 2 => "Middle", _ => "Left" };
@@ -183,10 +227,17 @@ public sealed class SeqAction
                 PixelCondition.IfNoMatch => $"Wait while {DescribeColor()} at {CondX},{CondY}",
                 _ => "Wait for pixel (no condition set)",
             },
+            ActionKind.Repeat => RepeatCount > 0 ? $"Repeat {RepeatCount}×" : "Repeat until Break",
+            ActionKind.EndBlock => "End block",
+            ActionKind.IfElse => $"If {ConditionExpr}",
+            ActionKind.SetVar => $"Set {VarName} = {ValueExpr}",
+            ActionKind.Break => "Break",
+            ActionKind.GotoLabel => $"Goto {Label}",
+            ActionKind.Label => $"Label {Label}",
             _ => Kind.ToString(),
         };
 
-        if (Kind == ActionKind.WaitPixel || Condition == PixelCondition.None) return baseDesc;
+        if (Kind == ActionKind.WaitPixel || IsControlKind(Kind) || Condition == PixelCondition.None) return baseDesc;
 
         string suffix = Condition == PixelCondition.IfMatch
             ? $"if {DescribeColor()} at {CondX},{CondY}"
@@ -199,7 +250,7 @@ public sealed class SeqAction
     {
         // WaitPixel has no click target of its own; show the pixel it samples instead.
         if (Kind == ActionKind.WaitPixel) return string.Create(CultureInfo.InvariantCulture, $"{CondX}, {CondY}");
-        if (Kind is ActionKind.Key or ActionKind.Text or ActionKind.Wait) return "—";
+        if (Kind is ActionKind.Key or ActionKind.Text or ActionKind.Wait || IsControlKind(Kind)) return "—";
         string pos = string.Create(CultureInfo.InvariantCulture, $"{X}, {Y}");
         return WindowRelative ? $"{pos} in {Ellipsis(WindowLabel, 24)}" : pos;
     }
@@ -210,6 +261,11 @@ public sealed class SeqAction
     public string WindowLabel =>
         !string.IsNullOrEmpty(WindowTitle) ? WindowTitle :
         !string.IsNullOrEmpty(WindowClass) ? WindowClass : "(unknown window)";
+
+    /// <summary>True for the kinds that structure flow instead of performing input.</summary>
+    internal static bool IsControlKind(ActionKind kind) => kind is
+        ActionKind.Repeat or ActionKind.EndBlock or ActionKind.IfElse or ActionKind.SetVar
+        or ActionKind.Break or ActionKind.GotoLabel or ActionKind.Label;
 
     private static string Ellipsis(string s, int max) =>
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max - 1), "…");

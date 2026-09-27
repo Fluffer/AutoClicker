@@ -45,6 +45,7 @@ internal sealed class SequenceRunner
     private readonly Func<bool> keepGoing;
     private readonly Action<int, bool>? onStep;
     private readonly Action<int>? onStepStarting;
+    private readonly Action? onPassComplete;
 
     /// <param name="keepGoing">Polled throughout a run; once it returns false the run unwinds promptly.</param>
     /// <param name="onStep">
@@ -59,11 +60,18 @@ internal sealed class SequenceRunner
     /// necessarily close together in time: a caller marshalling either callback to a UI thread
     /// must not assume they arrive back-to-back. May be null (headless).
     /// </param>
-    public SequenceRunner(Func<bool> keepGoing, Action<int, bool>? onStep = null, Action<int>? onStepStarting = null)
+    /// <param name="onPassComplete">
+    /// Invoked after each full sequence pass finishes (the instruction pointer reached the
+    /// end of the list on its own). Not invoked when a pass is cut short by
+    /// <paramref name="keepGoing"/> turning false. May be null (headless).
+    /// </param>
+    public SequenceRunner(Func<bool> keepGoing, Action<int, bool>? onStep = null,
+        Action<int>? onStepStarting = null, Action? onPassComplete = null)
     {
         this.keepGoing = keepGoing;
         this.onStep = onStep;
         this.onStepStarting = onStepStarting;
+        this.onPassComplete = onPassComplete;
     }
 
     public void RunSingle(SingleRunOptions options)
@@ -99,16 +107,33 @@ internal sealed class SequenceRunner
             // are posted to the window of the most recent positioned action.
             POINT lastTarget = CursorPos();
 
+            // Block/label structure is built once per run: it depends only on the action
+            // list, which the caller hands us as a snapshot. Variables are run-scoped too,
+            // so a SetVar persists across passes (while built-ins like `pass` are rewritten
+            // at the top of every pass).
+            var ctx = new RunContext(actions);
+
             while (keepGoing())
             {
-                for (int i = 0; i < actions.Count && keepGoing(); i++)
+                ctx.Variables["pass"] = VarValue.FromNumber(pass);
+                var cursor = CursorPos();
+                ctx.Variables["x"] = VarValue.FromNumber(cursor.X);
+                ctx.Variables["y"] = VarValue.FromNumber(cursor.Y);
+
+                int ip = 0;
+                while (ip < actions.Count && keepGoing())
                 {
-                    var a = actions[i];
-                    onStepStarting?.Invoke(i);
-                    bool performed = Execute(a, options.Background, options.JitterPixels, ref lastTarget);
-                    onStep?.Invoke(i, performed);
+                    int stepIp = ip;
+                    var a = actions[stepIp];
+                    onStepStarting?.Invoke(stepIp);
+                    bool performed = ExecuteStep(a, options, ref lastTarget, ctx, ref ip);
+                    onStep?.Invoke(stepIp, performed);
+                    // DelayMs applies after every action, control-flow included, so a tight
+                    // loop still idles at the configured pace instead of spinning the CPU.
                     InterruptibleSleep(JitterMs(a.DelayMs, options.JitterPercent));
                 }
+
+                if (ip >= actions.Count) onPassComplete?.Invoke();
                 pass++;
                 if (options.Limited && pass >= options.Limit) break;
             }
@@ -117,6 +142,134 @@ internal sealed class SequenceRunner
         {
             onStep?.Invoke(-1, true);
         }
+    }
+
+    /// <summary>Run-scoped control-flow state: block/label maps, variables, open repeat frames.</summary>
+    private sealed class RunContext
+    {
+        public IReadOnlyList<SeqAction> Actions { get; }
+        public Dictionary<int, int> BlockMap { get; }
+        public Dictionary<string, int> LabelMap { get; }
+        public Dictionary<string, VarValue> Variables { get; }
+        public Stack<RepeatFrame> Frames { get; } = new();
+
+        public RunContext(IReadOnlyList<SeqAction> actions)
+        {
+            Actions = actions;
+            BlockMap = ControlFlow.BuildBlockMap(actions);
+            LabelMap = ControlFlow.BuildLabelMap(actions);
+            Variables = new Dictionary<string, VarValue>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>One open <see cref="ActionKind.Repeat"/> block: where it starts, where it ends, and its progress.</summary>
+    private sealed class RepeatFrame
+    {
+        public int RepeatIp { get; }
+        public int CloseIp { get; }
+        /// <summary>0 = until Break/stop.</summary>
+        public int Limit { get; }
+        public int Count { get; set; }
+
+        public RepeatFrame(int repeatIp, int closeIp, int limit)
+        {
+            RepeatIp = repeatIp;
+            CloseIp = closeIp;
+            Limit = limit;
+            Count = 0;
+        }
+    }
+
+    /// <summary>
+    /// Executes one action and advances <paramref name="ip"/> past it. Control-flow kinds
+    /// (Repeat/EndBlock/IfElse/SetVar/Break/GotoLabel/Label) are handled here — they move
+    /// the instruction pointer instead of sending input, and they ignore pixel gates by
+    /// never reaching <see cref="Execute"/>. Everything else delegates to
+    /// <see cref="Execute"/>, which returns false when a pixel gate suppressed the action.
+    /// </summary>
+    private bool ExecuteStep(SeqAction a, RunOptions options, ref POINT lastTarget, RunContext ctx, ref int ip)
+    {
+        switch (a.Kind)
+        {
+            case ActionKind.Repeat:
+            {
+                int close = ctx.BlockMap.TryGetValue(ip, out int c) ? c : ctx.Actions.Count;
+                ctx.Frames.Push(new RepeatFrame(ip, close, a.RepeatCount));
+                ip++;
+                return true;
+            }
+
+            case ActionKind.EndBlock:
+            {
+                if (ctx.Frames.Count > 0 && ctx.Frames.Peek().CloseIp == ip)
+                {
+                    // This EndBlock closes the innermost Repeat: count the iteration.
+                    var frame = ctx.Frames.Pop();
+                    frame.Count++;
+                    if (frame.Limit > 0 && frame.Count >= frame.Limit)
+                        ip = frame.CloseIp + 1;
+                    else
+                    {
+                        ctx.Frames.Push(frame);
+                        ip = frame.RepeatIp + 1;
+                    }
+                }
+                else
+                {
+                    // Closes an IfElse (nothing to restore), or is a stray EndBlock: fall through.
+                    ip++;
+                }
+                return true;
+            }
+
+            case ActionKind.IfElse:
+            {
+                bool condition = EvaluateCondition(a, ctx);
+                if (condition) ip++;
+                else ip = (ctx.BlockMap.TryGetValue(ip, out int close) ? close : ctx.Actions.Count) + 1;
+                return true;
+            }
+
+            case ActionKind.SetVar:
+            {
+                ctx.Variables[a.VarName.Trim()] = ExpressionEvaluator.Evaluate(a.ValueExpr, ctx.Variables);
+                ip++;
+                return true;
+            }
+
+            case ActionKind.Break:
+            {
+                if (ctx.Frames.Count == 0)
+                    throw new InvalidOperationException("Break is not inside a Repeat block.");
+                var frame = ctx.Frames.Pop();
+                ip = frame.CloseIp + 1;
+                return true;
+            }
+
+            case ActionKind.GotoLabel:
+            {
+                string label = a.Label?.Trim() ?? "";
+                if (!ctx.LabelMap.TryGetValue(label, out int target))
+                    throw new InvalidOperationException($"Goto target '{label}' was not found in the sequence.");
+                ip = target;
+                return true;
+            }
+
+            case ActionKind.Label:
+                ip++;
+                return true;
+
+            default:
+                ip++;
+                return Execute(a, options.Background, options.JitterPixels, ref lastTarget);
+        }
+    }
+
+    private static bool EvaluateCondition(SeqAction a, RunContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(a.ConditionExpr))
+            throw new InvalidOperationException("IfElse has no condition expression.");
+        return ExpressionEvaluator.IsTruthy(ExpressionEvaluator.Evaluate(a.ConditionExpr, ctx.Variables));
     }
 
     /// <summary>
@@ -131,7 +284,11 @@ internal sealed class SequenceRunner
         return a.Condition == PixelCondition.IfMatch ? matches : !matches;
     }
 
-    /// <summary>Performs one sequence step. Returns false when a pixel gate suppressed it.</summary>
+    /// <summary>
+    /// Performs one ordinary sequence step. Returns false when a pixel gate suppressed it.
+    /// Control-flow kinds never reach here — <see cref="ExecuteStep"/> handles them before
+    /// delegating — so this method only ever sees input kinds (and WaitPixel).
+    /// </summary>
     private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget)
     {
         // A gate only applies to ordinary actions — WaitPixel is itself the wait mechanism, so
