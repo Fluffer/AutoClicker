@@ -9,9 +9,9 @@
     Title="Auto Clicker">
 
     <!--
-        M2a = LAYOUT ONLY. This is the WinUI 3 twin of Form1.BuildUi's row order:
-        toolbar / [scrollable sections] / status row. Interactivity lands in M2b; the
-        click handlers below are empty stubs so the markup compiles clean.
+        M2a = LAYOUT; M2b1 = the interactive core path (record, run/stop/pause/step, list
+        mutations, save/load, pick countdown, global hotkeys). The editor / find & replace /
+        schedule dialogs and the profile CRUD + hotkey rebind dialogs are still M2b2 / M3 stubs.
 
         Three deliberate WinUI-native replacements for WinForms mechanisms:
           * CollapsibleSection's glyph hack     ->  Microsoft.UI.Xaml.Controls.Expander
@@ -328,11 +328,11 @@
                                         </DataTemplate>
                                     </ListView.ItemTemplate>
                                     <ListView.ContextFlyout>
-                                        <MenuFlyout>
-                                            <MenuFlyoutItem Text="Run from here" Click="OnRunFromHereClick" />
-                                            <MenuFlyoutItem Text="Run selection" Click="OnRunSelectionClick" />
+                                        <MenuFlyout Opening="OnRowMenuOpening">
+                                            <MenuFlyoutItem x:Name="RunFromHereItem" Text="Run from here" Click="OnRunFromHereClick" />
+                                            <MenuFlyoutItem x:Name="RunSelectionItem" Text="Run selection" Click="OnRunSelectionClick" />
                                             <MenuFlyoutSeparator />
-                                            <MenuFlyoutItem Text="Insert breakpoint" Click="OnInsertBreakpointClick" />
+                                            <MenuFlyoutItem x:Name="InsertBreakpointItem" Text="Insert breakpoint" Click="OnInsertBreakpointClick" />
                                             <MenuFlyoutSeparator />
                                             <MenuFlyoutItem Text="Find&#x2026;" Click="OnFindClick" />
                                         </MenuFlyout>
@@ -362,7 +362,7 @@
                         </Border>
 
                         <StackPanel Grid.Row="0" Grid.RowSpan="2" Grid.Column="1" Spacing="4" VerticalAlignment="Top">
-                            <Button Content="&#x25CF; Record clicks" MinWidth="138" HorizontalAlignment="Stretch" Click="OnRecordClick" />
+                            <Button x:Name="RecordClicksButton" Content="&#x25CF; Record clicks" MinWidth="138" HorizontalAlignment="Stretch" Click="OnRecordClick" />
                             <Button Content="Add cursor pos" MinWidth="138" HorizontalAlignment="Stretch" Click="OnAddCursorPosClick" />
                             <Button Content="Add action&#x2026;" MinWidth="138" HorizontalAlignment="Stretch" Click="OnAddActionMenuClick" />
                             <Button Content="Edit&#x2026;" MinWidth="138" HorizontalAlignment="Stretch" Click="OnEditRowClick" />
