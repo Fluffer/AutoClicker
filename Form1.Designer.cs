@@ -9,6 +9,7 @@ partial class Form1
         if (disposing && (components != null))
         {
             components.Dispose();
+            runController?.Dispose();
         }
         base.Dispose(disposing);
     }

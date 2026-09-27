@@ -13,6 +13,7 @@ namespace AutoClicker.Tests;
 /// within a class serially — keeping all FilePath mutation in this one class is what
 /// makes that safe.
 /// </remarks>
+[Collection("ProfileStore")]
 public class ProfileStoreTests : IDisposable
 {
     private readonly string _dir;
