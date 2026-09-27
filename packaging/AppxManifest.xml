@@ -5,11 +5,15 @@
 
   <Identity Name="ISSpan.AutoClicker"
             Publisher="CN=Peter Eg, O=PETER EG, L=Singapore, C=SG"
-            Version="1.1.0.0"
+            Version="2.0.0.0"
             ProcessorArchitecture="x64" />
 
   <Properties>
     <DisplayName>Auto Clicker</DisplayName>
+    <!-- PublisherDisplayName is the friendly name shown in the store/Add-AppxPackage UI; it
+         does NOT have to match the certificate subject. The Identity Publisher above DOES:
+         it must equal the Subject of the code-signing certificate (packaging\Build-Package.ps1
+         fails fast when they differ). -->
     <PublisherDisplayName>ISSpan</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>

@@ -1,0 +1,73 @@
+name: Release
+
+# Builds, tests and packages a draft GitHub Release when a 'v*' tag is pushed.
+# The MSIX is packed UNSIGNED (CI has no code-signing certificate) — sign it
+# locally with packaging\Build-Package.ps1 before distributing.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build (Release)
+        run: dotnet build AutoClicker.Tests/AutoClicker.Tests.csproj -c Release
+
+      - name: Test
+        run: dotnet test AutoClicker.Tests/AutoClicker.Tests.csproj -c Release --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/TestResults/*.trx'
+          retention-days: 14
+
+      # Packages an UNSIGNED MSIX. -SkipSign keeps CI from touching the certificate
+      # store; the publish folder (installer\staging) is the self-contained win-x64
+      # build. Tolerate a missing Windows SDK so a packaging failure doesn't kill the
+      # whole release — the publish artifact is still uploaded below.
+      - name: Package (unsigned MSIX)
+        id: package
+        continue-on-error: true
+        shell: pwsh
+        run: pwsh -File packaging/Build-Package.ps1 -SkipSign
+
+      - name: Upload publish folder + MSIX
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            installer/AutoClicker.msix
+            installer/staging/**
+          if-no-files-found: warn
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --draft --generate-notes
+
+      - name: Attach MSIX (if built)
+        if: hashFiles('installer/AutoClicker.msix') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" installer/AutoClicker.msix --clobber
+
+      - name: Note (unsigned MSIX)
+        if: always()
+        run: |
+          "MSIX is **unsigned** in CI (no code-signing certificate). Sign it locally before distribution:" >> $env:GITHUB_STEP_SUMMARY
+          "``pwsh -File packaging\Build-Package.ps1 -SignThumbprint <thumbprint>``" >> $env:GITHUB_STEP_SUMMARY

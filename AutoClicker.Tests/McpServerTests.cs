@@ -163,4 +163,28 @@ public class McpServerTests
         var ctx = NewContext();
         Assert.Null(McpJsonRpc.HandleLine("""{"jsonrpc":"2.0","method":"ping"}""", ctx));
     }
+
+    [Fact]
+    public void Stdio_session_runs_initialize_and_tools_list_over_a_string_transport()
+    {
+        // RunSession is the transport-agnostic loop behind both the named-pipe server and
+        // --stdio. Driving it with StringReader/StringWriter exercises the exact stdio path
+        // without spawning a process.
+        var input = new StringReader(
+            """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}""" + "\n" +
+            """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""" + "\n");
+        var output = new StringWriter();
+
+        McpServer.RunSession(input, output, new McpRunHost());
+
+        string[] lines = output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, lines.Length);
+
+        using (var doc = JsonDocument.Parse(lines[0]))
+            Assert.Equal("2025-06-18",
+                doc.RootElement.GetProperty("result").GetProperty("protocolVersion").GetString());
+        using (var doc = JsonDocument.Parse(lines[1]))
+            Assert.Equal(7,
+                doc.RootElement.GetProperty("result").GetProperty("tools").GetArrayLength());
+    }
 }

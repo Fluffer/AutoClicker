@@ -45,6 +45,19 @@ static class Program
             // To customize application configuration such as set high DPI settings or default font,
             // see https://aka.ms/applicationconfiguration.
             ApplicationConfiguration.Initialize();
+
+            // Dark mode (SystemColorMode): applied before any window is created, after
+            // Initialize(). 0 = light (classic), 1 = dark, 2 = follow the system. A settings
+            // file saved before this feature existed has no ColorMode, so it defaults to 0
+            // (classic) and keeps the original look. Load() never throws, so this is safe.
+            AppSettings startupSettings = AppSettings.Load();
+            Application.SetColorMode(startupSettings.ColorMode switch
+            {
+                1 => SystemColorMode.Dark,
+                2 => SystemColorMode.System,
+                _ => SystemColorMode.Classic,
+            });
+
             Application.Run(new Form1());
             return 0;
         }

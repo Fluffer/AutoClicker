@@ -29,6 +29,7 @@ public partial class Form1 : Form
     private CheckBox chkCornerFailSafe = null!;
     private CheckBox chkRunLogging = null!;
     private CheckBox chkMinimizeToTray = null!;
+    private ComboBox cmbColorMode = null!;
     private Button btnSchedule = null!;
 
     // ---- Profiles ----
@@ -166,6 +167,7 @@ public partial class Form1 : Form
         chkCornerFailSafe.Checked = settings.CornerFailSafe;
         chkRunLogging.Checked = settings.RunLoggingEnabled;
         chkMinimizeToTray.Checked = settings.MinimizeToTray;
+        cmbColorMode.SelectedIndex = settings.ColorMode;
 
         RestoreLastSequence();
         RestoreProfiles();
@@ -198,6 +200,7 @@ public partial class Form1 : Form
         settings.CornerFailSafe = chkCornerFailSafe.Checked;
         settings.MaxRunSeconds = (int)numMaxRunSeconds.Value;
         settings.RunLoggingEnabled = chkRunLogging.Checked;
+        settings.ColorMode = cmbColorMode.SelectedIndex;
         settings.MinimizeToTray = chkMinimizeToTray.Checked;
 
         settings.UseProfiles = chkUseProfiles.Checked;
@@ -559,6 +562,18 @@ public partial class Form1 : Form
         btnSchedule = new Button { Text = "Schedule…", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
         btnSchedule.Click += (_, _) => BtnSchedule_Click();
         t.Controls.Add(btnSchedule, 0, 6);
+
+        // Colour mode is applied at process start (see Program.Main), before any window
+        // exists, so changing it here can't take effect until the next launch. Being honest
+        // about that beats a checkbox that claims to do something it can't.
+        cmbColorMode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, Margin = new Padding(3, 6, 3, 3) };
+        cmbColorMode.Items.AddRange("Light (classic)", "Dark", "Follow system");
+        cmbColorMode.SelectedIndex = 0;
+        t.Controls.Add(Lbl("Color mode"), 0, 7);
+        var colorModeFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        colorModeFlow.Controls.Add(cmbColorMode);
+        colorModeFlow.Controls.Add(Lbl("applies on next launch"));
+        t.Controls.Add(colorModeFlow, 1, 7);
 
         grp.Controls.Add(t);
         return grp;

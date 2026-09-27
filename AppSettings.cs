@@ -58,6 +58,9 @@ public sealed class AppSettings
     public bool MinimizeToTray { get; set; }
     public string LastSequencePath { get; set; } = "";
 
+    /// <summary>0 = light (classic), 1 = dark, 2 = follow the system colour mode.</summary>
+    public int ColorMode { get; set; }
+
     /// <summary>Name of the selected profile; "" means none selected (use the ad-hoc sequence).</summary>
     public string ActiveProfileName { get; set; } = "";
 
@@ -140,6 +143,7 @@ public sealed class AppSettings
         JitterPercent = Math.Clamp(JitterPercent, 0, 100);
         StartDelaySeconds = Math.Clamp(StartDelaySeconds, 0, 300);
         MaxRunSeconds = Math.Max(0, MaxRunSeconds);
+        ColorMode = Math.Clamp(ColorMode, 0, 2);
         PickedX = Math.Clamp(PickedX, -100_000, 100_000);
         PickedY = Math.Clamp(PickedY, -100_000, 100_000);
 

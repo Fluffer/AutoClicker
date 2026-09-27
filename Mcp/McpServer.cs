@@ -34,12 +34,14 @@ internal static class McpServer
         Environment.GetEnvironmentVariable("AUTOCLICKER_MCP_TRACE") == "1";
 
     /// <summary>
-    /// Parses the MCP-only arguments (<c>--pipe-name &lt;name&gt;</c>) and runs the pipe loop
-    /// until the process is killed. <paramref name="args"/> is everything after <c>--mcp</c>.
+    /// Parses the MCP-only arguments (<c>--pipe-name &lt;name&gt;</c>, <c>--stdio</c>) and runs
+    /// the server until the process is killed or stdin closes. <paramref name="args"/> is
+    /// everything after <c>--mcp</c>.
     /// </summary>
     public static int Run(string[] args)
     {
         string? pipeName = null;
+        bool stdio = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -48,12 +50,21 @@ internal static class McpServer
                     if (i + 1 >= args.Length) return Usage("--pipe-name requires a value.");
                     pipeName = args[++i];
                     break;
+                case "--stdio":
+                    stdio = true;
+                    break;
                 case "--help" or "-h":
                     PrintHelp();
                     return ExitSuccess;
                 default:
                     return Usage($"Unknown MCP option '{args[i]}'.");
             }
+        }
+
+        if (stdio)
+        {
+            if (pipeName is not null) return Usage("--stdio and --pipe-name are mutually exclusive.");
+            return RunStdio();
         }
 
         return RunServer(pipeName ?? DefaultPipeName());
@@ -110,7 +121,6 @@ internal static class McpServer
             // The run host outlives individual connections: a run keeps going (and get_state
             // still reports it) after a client disconnects and reconnects.
             var runHost = new McpRunHost();
-            var registry = McpToolRegistry.BuildDefault(runHost, UserDataPaths.RootDir);
 
             Trace($"MCP server listening on pipe '{pipeName}'.");
 
@@ -132,30 +142,7 @@ internal static class McpServer
                 using var writer = new StreamWriter(server, new UTF8Encoding(false),
                     bufferSize: 4096, leaveOpen: true) { AutoFlush = true, NewLine = "\n" };
 
-                // Fresh per-connection protocol state (each client runs its own initialize handshake).
-                var context = new McpContext { Tools = registry };
-
-                while (true)
-                {
-                    string? line;
-                    try
-                    {
-                        line = reader.ReadLine();
-                    }
-                    catch (IOException)
-                    {
-                        line = null; // client vanished mid-line
-                    }
-                    if (line is null) break;
-
-                    Trace("< " + line);
-                    string? response = McpJsonRpc.HandleLine(line, context);
-                    if (response is not null)
-                    {
-                        Trace("> " + response);
-                        writer.WriteLine(response);
-                    }
-                }
+                RunSession(reader, writer, runHost);
 
                 server.Disconnect();
                 Trace("client disconnected");
@@ -163,6 +150,60 @@ internal static class McpServer
         }
 
         return ExitSuccess;
+    }
+
+    /// <summary>
+    /// stdio transport: speak MCP JSON-RPC on the process's own stdin/stdout and run until
+    /// stdin closes. This is the transport mainstream MCP clients (Claude Desktop, VS Code
+    /// Copilot) expect — they spawn <c>AutoClicker.exe --mcp --stdio</c> with redirected
+    /// standard handles, so no console is needed and no pipe name has to be discovered.
+    /// </summary>
+    private static int RunStdio()
+    {
+        var stdin = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false));
+        var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false))
+        {
+            AutoFlush = true,
+            NewLine = "\n",
+        };
+
+        RunSession(stdin, stdout, new McpRunHost());
+        return ExitSuccess;
+    }
+
+    /// <summary>
+    /// The request/response loop, transport-agnostic: read a newline-delimited JSON request
+    /// from <paramref name="input"/>, dispatch it through <see cref="McpJsonRpc.HandleLine"/>,
+    /// write the response line to <paramref name="output"/>. Runs until the input ends (or
+    /// the reader throws, e.g. a client disconnecting mid-line). Shared by the pipe loop and
+    /// the stdio loop; exposed so tests can drive a session over <see cref="StringReader"/>.
+    /// </summary>
+    internal static void RunSession(TextReader input, TextWriter output, McpRunHost runHost)
+    {
+        var registry = McpToolRegistry.BuildDefault(runHost, UserDataPaths.RootDir);
+        var context = new McpContext { Tools = registry };
+
+        while (true)
+        {
+            string? line;
+            try
+            {
+                line = input.ReadLine();
+            }
+            catch (IOException)
+            {
+                line = null; // client vanished mid-line
+            }
+            if (line is null) break;
+
+            Trace("< " + line);
+            string? response = McpJsonRpc.HandleLine(line, context);
+            if (response is not null)
+            {
+                Trace("> " + response);
+                output.WriteLine(response);
+            }
+        }
     }
 
     private static void Trace(string message)
@@ -186,15 +227,17 @@ internal static class McpServer
             Auto Clicker - MCP server mode (lets an AI assistant drive AutoClicker)
 
             Usage:
-              AutoClicker.exe --mcp [--pipe-name <name>]
+              AutoClicker.exe --mcp [--pipe-name <name> | --stdio]
 
             Options:
-              --pipe-name <name>   Listen on a specific pipe name
+              --pipe-name <name>   Listen on a specific named pipe
                                    (default: AutoClicker.mcp.<username>)
+              --stdio              Speak JSON-RPC on stdin/stdout instead of a pipe
+                                   (the transport Claude Desktop / VS Code Copilot expect)
 
-            The server speaks MCP (JSON-RPC 2.0, newline-delimited) over the named pipe and
-            runs until the process is killed. Protocol trace lines go to stderr when the
-            AUTOCLICKER_MCP_TRACE environment variable is set to 1.
+            The server speaks MCP (JSON-RPC 2.0, newline-delimited) and runs until the
+            process is killed (pipe) or stdin closes (stdio). Protocol trace lines go to
+            stderr when the AUTOCLICKER_MCP_TRACE environment variable is set to 1.
             """);
     }
 }
