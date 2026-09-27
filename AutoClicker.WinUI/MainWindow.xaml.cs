@@ -6,6 +6,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
 using Windows.Storage;
@@ -20,8 +21,10 @@ namespace AutoClicker.WinUI;
 /// The WinUI 3 twin of Form1: the full main-window layout plus (M2b1) the interactive
 /// core path — record, run/stop/pause/step, list mutations, save/load, the pick countdown
 /// and global-hotkey delivery — and (M2b2) profile management, the start/stop and panic
-/// rebind dialogs, and target-app auto-switching. The editor / find &amp; replace / schedule
-/// dialogs are still tagged <c>M3</c> stubs.
+/// rebind dialogs, and target-app auto-switching. The M3 dialogs — the action editor,
+/// find &amp; replace and the two schedule dialogs — are ported too; only the schedule
+/// FIRE path (ScheduleWatcher) is WinForms-only until the WinUI entry point learns the
+/// CLI's --run/--profile arguments.
 /// </summary>
 /// <remarks>
 /// Row order mirrors <c>Form1.BuildUi</c>: toolbar, then the sections (interval, options +
@@ -137,10 +140,15 @@ public sealed partial class MainWindow : Window, IDisposable
     private readonly DispatcherQueueTimer _runTimer;
     private int _runStepIndex = -1;
 
-    // Pick-location countdown (Form1's pickTimer / pickCountdown / pickDone).
-    private DispatcherQueueTimer? _pickTimer;
-    private int _pickCountdown;
-    private Action? _pickDone;
+    // Pick-location countdown (Form1's pickTimer / pickCountdown / pickDone). M3 extracted
+    // the countdown itself into PickCountdown so the action editor's three capture flows
+    // (position pick / pixel pick / template capture) drive the SAME mechanism with their
+    // own per-tick button captions instead of duplicating the timer code.
+    private PickCountdown? _pick;
+
+    // The single modeless Find & Replace window (WinForms' findReplaceForm / F7-Ctrl+F).
+    // One instance only; Ctrl+F and the context menu refocus it when it already exists.
+    private FindReplaceDialog? _findReplace;
 
     // WinUI allows exactly ONE ContentDialog at a time: a second concurrent ShowAsync does not
     // throw a catchable managed exception, it faults inside Microsoft.UI.Xaml.dll (verified:
@@ -1556,28 +1564,17 @@ public sealed partial class MainWindow : Window, IDisposable
 
     /// <summary>
     /// Form1.StartPick: a 3-second countdown in the status line, then the callback. The
-    /// WinForms timer becomes a DispatcherQueueTimer; the repeat semantics are identical.
+    /// WinForms timer becomes the shared <see cref="PickCountdown"/> (a DispatcherQueueTimer
+    /// under the hood); the repeat semantics are identical.
     /// </summary>
     private void StartPick(Action done)
     {
-        _pickDone = done;
-        _pickCountdown = 3;
-        _pickTimer?.Stop();
-        _pickTimer = DispatcherQueue.CreateTimer();
-        _pickTimer.Interval = TimeSpan.FromSeconds(1);
-        _pickTimer.IsRepeating = true;
-        SetStatus($"Move mouse to target... capturing in {_pickCountdown}s");
-        _pickTimer.Tick += (sender, _) =>
-        {
-            _pickCountdown--;
-            if (_pickCountdown > 0) { SetStatus($"Move mouse to target... capturing in {_pickCountdown}s"); return; }
-            sender.Stop();
-            _pickTimer = null;
-            Action? callback = _pickDone;
-            _pickDone = null;
-            callback?.Invoke();
-        };
-        _pickTimer.Start();
+        _pick?.Dispose();
+        _pick = PickCountdown.Start(
+            DispatcherQueue,
+            3,
+            n => SetStatus($"Move mouse to target... capturing in {n}s"),
+            () => { _pick = null; done(); });
     }
 
     /// <summary>0..999 ms → "N ms", &lt; 60 s → "N.N s", otherwise "N m N s" (Form1.FormatDuration).</summary>
@@ -1775,9 +1772,13 @@ public sealed partial class MainWindow : Window, IDisposable
         _runController.Stop();
         if (_recordingController.IsRecording) StopRecording();
 
-        _pickTimer?.Stop();
-        _pickTimer = null;
-        _pickDone = null;
+        // Form1.OnFormClosing closes its modeless find dialog first; same here, so the
+        // second window can't outlive the one it calls back into.
+        _findReplace?.Close();
+        _findReplace = null;
+
+        _pick?.Dispose();
+        _pick = null;
 
         _runTimer.Stop();
         _autoSwitchTimer?.Stop();
@@ -1824,22 +1825,73 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void OnAddActionClick(object sender, RoutedEventArgs e)
     {
-        // M3: open the action editor seeded with the kind in ((MenuFlyoutItem)sender).Tag
-        // (Click/Drag/Scroll/Key/Text/Wait/WaitPixel/FindImage/FindText/Repeat/IfElse/Else/
-        // SetVar/Label/GotoLabel/Break/Breakpoint).
+        // MenuFlyoutItem.Tag carries the preset kind name (ActionKind's own spelling).
+        if (sender is MenuFlyoutItem { Tag: string tag } && Enum.TryParse(tag, out ActionKind kind))
+            AddCustomAction(kind);
     }
 
-    private void OnAddActionMenuClick(object sender, RoutedEventArgs e)
+    private void OnAddActionMenuClick(object sender, RoutedEventArgs e) => AddCustomAction(null);
+
+    /// <summary>
+    /// Form1.AddCustomAction: seed a fresh action (interval as the delay, current mouse
+    /// button, cursor position as X/Y — the same three defaults), open the editor on it and
+    /// append the result. The preset kind from the Add ▾ menu lands in the seed so the
+    /// editor opens already switched to that kind.
+    /// </summary>
+    private async void AddCustomAction(ActionKind? presetKind)
     {
-        // M3: same editor, but asking for the kind first.
+        if (_dialogOpen) return;
+
+        var seed = new SeqAction { DelayMs = IntervalMs(), Button = MouseButtonCombo.SelectedIndex };
+        if (presetKind is ActionKind kind) seed.Kind = kind;
+        POINT cur = CursorPos();
+        seed.X = cur.X;
+        seed.Y = cur.Y;
+
+        var dlg = new ActionEditorDialog(Root.XamlRoot, DispatcherQueue, _hwnd, seed, "Add action", _points);
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+
+        _points.Add(dlg.Result);
+        RefreshList();
+        if (UseSequenceCheck.IsChecked != true) UseSequenceCheck.IsChecked = true;
+        if (SequenceList.Items.Count > 0) SequenceList.SelectedIndex = SequenceList.Items.Count - 1;
+        SetStatus($"Added action #{_points.Count}: {dlg.Result.Describe()}");
     }
 
     private void OnAddCursorPosClick(object sender, RoutedEventArgs e) => AddPoint(CursorPos());
 
-    private void OnEditRowClick(object sender, RoutedEventArgs e)
+    private void OnEditRowClick(object sender, RoutedEventArgs e) => EditSelectedPoint();
+
+    /// <summary>Form1.EditSelectedPoint: edit the selected row, or say so when nothing is selected.</summary>
+    private void EditSelectedPoint()
     {
-        // M3: edit the selected row (ActionEditorForm → ContentDialog).
+        int i = SelectedIndex();
+        if (i < 0) { SetStatus("Select an action first, then Edit."); return; }
+        _ = EditPointAt(i);
     }
+
+    /// <summary>
+    /// Form1.EditPointAt: opens the editor on one row. Shared with the Find &amp; Replace
+    /// window, which may pass a row it selected rather than the user's selection — hence the
+    /// explicit re-select after RefreshList (which rebuilds ItemsSource and drops it).
+    /// </summary>
+    private async Task EditPointAt(int i)
+    {
+        if (i < 0 || i >= _points.Count) return;
+        // The find window is modeless and can call back while another dialog is already up;
+        // a second concurrent ShowAsync faults inside Microsoft.UI.Xaml.dll (not catchable).
+        if (_dialogOpen) return;
+
+        var dlg = new ActionEditorDialog(Root.XamlRoot, DispatcherQueue, _hwnd, _points[i], $"Edit action #{i + 1}", _points);
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+
+        _points[i] = dlg.Result;
+        RefreshList();
+        if (i < SequenceList.Items.Count) SequenceList.SelectedIndex = i;
+    }
+
+    /// <summary>The list's double-click / double-tap, exactly like Form1's lvPoints.DoubleClick.</summary>
+    private void OnListDoubleTapped(object sender, DoubleTappedRoutedEventArgs e) => EditSelectedPoint();
 
     private void OnRemoveRowClick(object sender, RoutedEventArgs e) => RemoveSelectedPoint();
 
@@ -1861,9 +1913,47 @@ public sealed partial class MainWindow : Window, IDisposable
 
     private void OnInsertBreakpointClick(object sender, RoutedEventArgs e) => InsertBreakpoint();
 
-    private void OnFindClick(object sender, RoutedEventArgs e)
+    private void OnFindClick(object sender, RoutedEventArgs e) => ShowFindReplace();
+
+    /// <summary>Form1's Ctrl+F accelerator: works no matter which child control has focus.</summary>
+    private void OnFindAccelerator(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs e)
     {
-        // M3: the Find & Replace dialog.
+        ShowFindReplace();
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Form1.ShowFindReplace: one modeless instance. Reopening just refocuses its Find box,
+    /// and the callbacks keep it stateless — it always reads the live list through them.
+    /// </summary>
+    private void ShowFindReplace()
+    {
+        if (_findReplace is not null)
+        {
+            _findReplace.Activate();
+            _findReplace.FocusFindBox();
+            return;
+        }
+
+        _findReplace = new FindReplaceDialog(
+            () => _points,
+            SelectedIndex,
+            SelectRow,
+            i => _ = EditPointAt(i), // modeless: fire-and-forget so the find window stays usable
+            () => _runController.IsBusy || _runController.IsRunning || _recordingController.IsRecording,
+            RefreshList,
+            SetStatus);
+        _findReplace.Closed += (_, _) => _findReplace = null;
+        _findReplace.Activate();
+        _findReplace.FocusFindBox();
+    }
+
+    /// <summary>Selects and scrolls to a row, for the Find dialog to land on a match.</summary>
+    private void SelectRow(int index)
+    {
+        if (index < 0 || index >= SequenceList.Items.Count) return;
+        SequenceList.SelectedIndex = index;
+        SequenceList.ScrollIntoView(SequenceList.Items[index]);
     }
 
     /// <summary>
@@ -2003,8 +2093,22 @@ public sealed partial class MainWindow : Window, IDisposable
         _hotkeyManager.RegisterMain(_hotkeyVk, _hotkeyModifiers, _hotkeyName);
     }
 
-    private void OnScheduleClick(object sender, RoutedEventArgs e)
+    private void OnScheduleClick(object sender, RoutedEventArgs e) => ShowScheduleDialog();
+
+    /// <summary>
+    /// Form1.BtnSchedule_Click: the schedule list dialog. It owns its own <c>_dialogOpen</c>
+    /// gate the way every other dialog here does, because the schedule list and its edit
+    /// panel live in ONE ContentDialog (WinUI forbids the nested ShowAsync an Add/Edit
+    /// sub-dialog would need).
+    /// </summary>
+    private void ShowScheduleDialog()
     {
-        // M3: the schedule editor.
+        if (_dialogOpen) return;
+        _dialogOpen = true;
+        // Plain Window (not ContentDialog): the dialog style's 548 logical px MaxWidth
+        // cap clipped the two-column layout and MaxWidth=900 didn't override it (M3 QA).
+        var dialog = new ScheduleDialog(_hwnd, _profileController.Profiles);
+        dialog.Closed += (_, _) => _dialogOpen = false;
+        dialog.Show();
     }
 }
