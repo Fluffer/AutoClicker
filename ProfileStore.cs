@@ -29,6 +29,10 @@ public sealed class Profile
         if (Name.Length > MaxNameLength) Name = Name[..MaxNameLength];
 
         Actions ??= new List<SeqAction>();
+        // Same null-element hazard as in ProfileStore.Load: a literal null in the Actions
+        // array must not survive to the NRE below (and Normalize is called from catch-free
+        // paths in the CLI too).
+        Actions.RemoveAll(a => a is null);
         foreach (SeqAction action in Actions) action.Normalize();
 
         // Only F1-F12 or "none" are valid; anything else (stale VK from a hand-edited
@@ -73,7 +77,7 @@ internal static class ProfileStore
     }
 
     /// <summary>Where profiles are read from and written to: <c>%AppData%\AutoClicker\profiles.json</c>.</summary>
-    public static string FilePath { get; } = Path.Combine(
+    public static string FilePath { get; internal set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClicker", "profiles.json");
 
     /// <summary>
@@ -120,6 +124,11 @@ internal static class ProfileStore
         var claimedHotkeys = new HashSet<uint>();
         foreach (Profile profile in loaded)
         {
+            // A JSON array element can be literal null ("[...] , null]" in a hand-edited
+            // file). Normalize() would NRE on it and, being outside the try above, brick
+            // every launch until the user found and deleted the file by hand.
+            if (profile is null) continue;
+
             profile.Normalize();
             if (profile.Name.Length == 0) continue; // unusable without a name
 

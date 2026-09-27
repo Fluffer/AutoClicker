@@ -163,17 +163,21 @@ internal static class CliRunner
 
             try
             {
-                var loaded = JsonSerializer.Deserialize<List<SeqAction>>(File.ReadAllText(runFile));
-                if (loaded is null)
-                {
-                    Console.Error.WriteLine($"'{runFile}' contains no actions.");
-                    return ExitRuntimeFailure;
-                }
-                actions = loaded;
+                actions = SequenceFile.Deserialize(File.ReadAllText(runFile));
+            }
+            catch (SequenceFile.UnsupportedVersionException ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                return ExitRuntimeFailure;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
             {
                 Console.Error.WriteLine($"Failed to read '{runFile}': {ex.Message}");
+                return ExitRuntimeFailure;
+            }
+            if (actions.Count == 0)
+            {
+                Console.Error.WriteLine($"'{runFile}' contains no actions.");
                 return ExitRuntimeFailure;
             }
             sourceLabel = Path.GetFileName(runFile);

@@ -97,7 +97,10 @@ public sealed class AppSettings
             string? dir = Path.GetDirectoryName(FilePath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-            string tempPath = FilePath + ".tmp";
+            // Per-process temp name (mirrors ProfileStore.Save): the GUI and a CLI run can
+            // both be saving, and a shared "settings.json.tmp" would let one truncate the
+            // file the other is mid-write on.
+            string tempPath = $"{FilePath}.{Environment.ProcessId}.tmp";
             File.WriteAllText(tempPath, JsonSerializer.Serialize(this, JsonOptions));
             File.Move(tempPath, FilePath, overwrite: true);
             return true;

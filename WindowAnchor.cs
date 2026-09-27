@@ -71,12 +71,21 @@ internal static class WindowAnchor
     /// <summary>
     /// Best visible top-level window for a class/title pair. Titles change constantly
     /// (documents, tab names, unsaved markers), so an exact match is preferred but a
-    /// prefix or substring match is accepted before giving up; a class-only match is
-    /// the last resort.
+    /// prefix or substring match — all still title-based signals that the window really
+    /// is the recorded one — is accepted before giving up.
     /// </summary>
+    /// <remarks>
+    /// Deliberately NO class-only fallback when a title was recorded: resolving "Chrome,
+    /// Gmail — Inbox" to whatever Chrome window happens to be topmost after that window
+    /// closes would send clicks to the wrong window, which for an auto-clicker is a
+    /// data-destruction bug, not an inconvenience. The step now fails loudly instead
+    /// (the runner reports "anchor window not open"). Class-only matching remains only
+    /// for anchors that never recorded a title in the first place — there it is the
+    /// primary signal, not a fallback.
+    /// </remarks>
     public static IntPtr Find(string cls, string title)
     {
-        IntPtr exact = IntPtr.Zero, prefix = IntPtr.Zero, contains = IntPtr.Zero, classOnly = IntPtr.Zero;
+        IntPtr exact = IntPtr.Zero, prefix = IntPtr.Zero, contains = IntPtr.Zero;
         bool haveCls = !string.IsNullOrEmpty(cls);
         bool haveTitle = !string.IsNullOrEmpty(title);
         if (!haveCls && !haveTitle) return IntPtr.Zero;
@@ -88,18 +97,15 @@ internal static class WindowAnchor
             if (haveCls && !string.Equals(ClassNameOf(hwnd), cls, StringComparison.Ordinal))
                 return true;
 
+            // No title recorded: the class (plus visibility) is the whole match.
             if (!haveTitle)
             {
-                if (classOnly == IntPtr.Zero) classOnly = hwnd;
+                if (exact == IntPtr.Zero) exact = hwnd;
                 return true;
             }
 
             string t = TitleOf(hwnd);
-            if (t.Length == 0)
-            {
-                if (classOnly == IntPtr.Zero) classOnly = hwnd;
-                return true;
-            }
+            if (t.Length == 0) return true; // untitled window cannot match a recorded title
 
             if (string.Equals(t, title, StringComparison.Ordinal))
             {
@@ -110,8 +116,6 @@ internal static class WindowAnchor
                 prefix = hwnd;
             else if (contains == IntPtr.Zero && t.Contains(title, StringComparison.OrdinalIgnoreCase))
                 contains = hwnd;
-            else if (classOnly == IntPtr.Zero)
-                classOnly = hwnd;
 
             return true;
         }, IntPtr.Zero);
@@ -119,6 +123,6 @@ internal static class WindowAnchor
         if (exact != IntPtr.Zero) return exact;
         if (prefix != IntPtr.Zero) return prefix;
         if (contains != IntPtr.Zero) return contains;
-        return haveCls ? classOnly : IntPtr.Zero;
+        return IntPtr.Zero; // recorded title exists but no window matches it: fail loudly
     }
 }

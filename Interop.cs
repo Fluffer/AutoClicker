@@ -83,7 +83,6 @@ internal static class Native
     internal const uint INPUT_MOUSE = 0;
     internal const uint INPUT_KEYBOARD = 1;
 
-    internal const uint MOUSEEVENTF_MOVE = 0x0001;
     internal const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     internal const uint MOUSEEVENTF_LEFTUP = 0x0004;
     internal const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;

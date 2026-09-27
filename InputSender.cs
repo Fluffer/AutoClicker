@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Globalization;
 using System.Runtime.InteropServices;
 using static AutoClicker.Native;
 
@@ -214,7 +213,11 @@ internal static class InputSender
     public static void Drag(int x1, int y1, int x2, int y2, int button, int dragMs, Func<bool> keepGoing)
     {
         var (down, up) = MouseFlags(button);
-        SetCursorPos(x1, y1);
+        // A failed move here would press at the cursor's current location instead of (x1,y1);
+        // throw rather than start the drag from a point the sequence never named.
+        if (!SetCursorPos(x1, y1))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                $"Could not move the cursor to {x1},{y1} — drag aborted to avoid starting at the wrong position.");
         Thread.Sleep(10); // let the target register the hover before the press
         Send(new[] { Mouse(down) });
         try
@@ -223,10 +226,15 @@ internal static class InputSender
             int stepMs = Math.Max(0, dragMs / steps);
             for (int s = 1; s <= steps && keepGoing(); s++)
             {
+                // Mid-travel moves are best-effort: a transient failure (rare — secure
+                // desktop aside, SetCursorPos only fails on bad coordinates) shouldn't
+                // abort the drag and strand the button; the final move below is checked.
                 SetCursorPos(Lerp(x1, x2, s, steps), Lerp(y1, y2, s, steps));
                 if (stepMs > 0) Thread.Sleep(stepMs);
             }
-            SetCursorPos(x2, y2);
+            if (!SetCursorPos(x2, y2))
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    $"Could not move the cursor to {x2},{y2} — drag ended at the wrong position.");
             Thread.Sleep(10); // ...and to register the final position before the release
         }
         finally
@@ -441,6 +449,4 @@ internal static class InputSender
     /// <summary>Validation helper for the action editor.</summary>
     public static string? DescribeComboProblem(string combo) =>
         TryParseCombo(combo, out _, out _, out string error) ? null : error;
-
-    public static string FormatNotches(int n) => n.ToString(CultureInfo.InvariantCulture);
 }

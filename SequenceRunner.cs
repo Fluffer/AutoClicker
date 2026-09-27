@@ -1,5 +1,7 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using static AutoClicker.Native;
 
 namespace AutoClicker;
@@ -68,7 +70,7 @@ internal sealed class SequenceRunner
     {
         using var timerRes = new TimerResolutionScope();
 
-        if (options.UseFixedPosition) SetCursorPos(options.X, options.Y);
+        if (options.UseFixedPosition) MoveToOrFail(options.X, options.Y);
         if (options.Hold)
         {
             InputSender.HoldUntil(options.Button, keepGoing);
@@ -79,7 +81,7 @@ internal sealed class SequenceRunner
         while (keepGoing())
         {
             if (options.UseFixedPosition)
-                SetCursorPos(options.X + JitterPx(options.JitterPixels), options.Y + JitterPx(options.JitterPixels));
+                MoveToOrFail(options.X + JitterPx(options.JitterPixels), options.Y + JitterPx(options.JitterPixels));
             InputSender.Click(options.Button, options.DoubleClick);
             count++;
             if (options.Limited && count >= options.Limit) break;
@@ -201,7 +203,7 @@ internal sealed class SequenceRunner
                 // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
                 // panic key wait out the whole hold before taking effect.
                 else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
-                else { SetCursorPos(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
+                else { MoveToOrFail(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
                 break;
 
             case ActionKind.Drag:
@@ -215,7 +217,7 @@ internal sealed class SequenceRunner
                 // Same reasoning as Drag: no UIA equivalent for a wheel notch, so method 2 also
                 // falls back to PostMessage.
                 if (method != 0) InputSender.BackgroundScroll(x, y, a.ScrollNotches, a.Horizontal);
-                else { SetCursorPos(x, y); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
+                else { MoveToOrFail(x, y); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
                 break;
 
             case ActionKind.Key:
@@ -253,13 +255,28 @@ internal sealed class SequenceRunner
 
     private static POINT CursorPos() { GetCursorPos(out POINT p); return p; }
 
+    /// <summary>
+    /// Moves the real cursor, aborting the step when the move fails. An unchecked
+    /// <see cref="SetCursorPos"/> failure means the click that follows lands wherever the
+    /// cursor already was — silently clicking the wrong thing — so this throws the same
+    /// way the SendInput path does when it's blocked.
+    /// </summary>
+    private static void MoveToOrFail(int x, int y)
+    {
+        if (!SetCursorPos(x, y))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                $"Could not move the cursor to {x},{y} — the click would have landed at the wrong position.");
+    }
+
     // Waits `ms`, but bails out early once `keepGoing` goes false.
     // Measured against a Stopwatch rather than by accumulating fixed steps: the old
     // "sleep 25 ms until you've slept enough" loop overshot every interval that wasn't
     // a multiple of 25 (a 30 ms interval actually waited 50 ms).
     private void InterruptibleSleep(int ms)
     {
-        if (ms <= 0) return; // 0 means "as fast as possible", not "sleep a tick"
+        // 0 means "as fast as possible", but returning without ever sleeping pinned a core
+        // at 100% for the whole run: floor at 1 ms so the loop still yields the CPU.
+        if (ms < 1) ms = 1;
         var sw = Stopwatch.StartNew();
         while (keepGoing())
         {

@@ -179,15 +179,14 @@ public partial class Form1 : Form
 
         try
         {
-            var loaded = JsonSerializer.Deserialize<List<SeqAction>>(File.ReadAllText(path));
-            if (loaded == null) throw new JsonException("empty file");
-            foreach (var a in loaded) a.Normalize();
+            var loaded = SequenceFile.Deserialize(File.ReadAllText(path));
             points = loaded;
             RefreshList();
             chkSequence.Checked = points.Count > 0;
             lblStatus.Text = $"Restored {points.Count} actions from {Path.GetFileName(path)}.";
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or JsonException or SequenceFile.UnsupportedVersionException)
         {
             settings.LastSequencePath = "";
             lblStatus.Text = "Could not restore the last sequence — starting empty.";
@@ -500,8 +499,6 @@ public partial class Form1 : Form
         flow.Controls.Add(Lbl("seconds (0 = immediately)"));
         chkPanic = new CheckBox { Text = "Esc panic-stops the run", AutoSize = true, Checked = true, Margin = new Padding(18, 6, 3, 3) };
         flow.Controls.Add(chkPanic);
-        // Not persisted: AppSettings.cs is owned elsewhere this session, so this checkbox
-        // only holds its value in memory for the life of the process.
         chkMinimizeToTray = new CheckBox { Text = "Minimize to tray", AutoSize = true, Margin = new Padding(18, 6, 3, 3) };
         flow.Controls.Add(chkMinimizeToTray);
         grp.Controls.Add(flow);
@@ -734,8 +731,6 @@ public partial class Form1 : Form
     }
 
     // ---- Save / Load sequence (JSON) ----
-    private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
-
     private void SaveSequence()
     {
         if (points.Count == 0) { lblStatus.Text = "Nothing to save — sequence is empty."; return; }
@@ -743,7 +738,7 @@ public partial class Form1 : Form
         if (sfd.ShowDialog(this) != DialogResult.OK) return;
         try
         {
-            File.WriteAllText(sfd.FileName, JsonSerializer.Serialize(points, JsonOpts));
+            File.WriteAllText(sfd.FileName, SequenceFile.Serialize(points));
             settings.LastSequencePath = sfd.FileName;
             lblStatus.Text = $"Saved {points.Count} actions to {Path.GetFileName(sfd.FileName)}";
         }
@@ -759,16 +754,15 @@ public partial class Form1 : Form
         if (ofd.ShowDialog(this) != DialogResult.OK) return;
         try
         {
-            var loaded = JsonSerializer.Deserialize<List<SeqAction>>(File.ReadAllText(ofd.FileName));
-            if (loaded == null) { lblStatus.Text = "Load failed: empty file."; return; }
-            foreach (var a in loaded) a.Normalize();
+            var loaded = SequenceFile.Deserialize(File.ReadAllText(ofd.FileName));
             points = loaded;
             RefreshList();
             chkSequence.Checked = points.Count > 0;
             settings.LastSequencePath = ofd.FileName;
             lblStatus.Text = $"Loaded {points.Count} actions from {Path.GetFileName(ofd.FileName)}";
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                      or JsonException or SequenceFile.UnsupportedVersionException)
         {
             lblStatus.Text = "Load failed: " + ex.Message;
         }
@@ -1332,6 +1326,15 @@ public partial class Form1 : Form
     private void HandleProfileHotkey(int index)
     {
         if (index < 0 || index >= profiles.Count) return;
+
+        // Refuse the whole switch while a run owns the engine. Switching first and letting
+        // StartClicking() then early-return on `busy` left the list showing a DIFFERENT
+        // profile than the one executing — nothing started, nothing stopped, no explanation.
+        if (Volatile.Read(ref busy) != 0 || running)
+        {
+            lblStatus.Text = $"Stop the current run before switching to \"{profiles[index].Name}\".";
+            return;
+        }
 
         SwitchToProfile(index);
         suppressProfileEvents = true;

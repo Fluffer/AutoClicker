@@ -1,0 +1,21 @@
+# Normalize line endings; let Git detect text vs binary.
+* text=auto
+
+# Windows-native files keep CRLF in the working tree.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.cs text eol=crlf
+*.csproj text eol=crlf
+*.sln text eol=crlf
+
+# Cross-platform-ish files use LF.
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Binary assets — never touch.
+*.png binary
+*.ico binary
+*.msix binary
+*.trx text eol=lf
