@@ -37,6 +37,9 @@ public partial class Form1 : Form
 
     // ---- State ----
     private List<SeqAction> points = new();
+    // How many actions `points` held when the current recording started, so the live and
+    // finished status lines report only what THIS session recorded.
+    private int recordStartCount;
     private uint hotkeyVk = 0x75; // F6
     private string hotkeyName = "F6";
     private System.Windows.Forms.Timer? pickTimer;
@@ -91,7 +94,7 @@ public partial class Form1 : Form
         hotkeyManager.EndRecordingPressed += () => { if (recordingController.IsRecording) StopRecording(); };
         hotkeyManager.PanicPressed += () => runController.PanicStop();
         hotkeyManager.ProfileHotkeyPressed += HandleProfileHotkey;
-        recordingController.PointRecorded += AddPoint;
+        recordingController.ActionRecorded += AddRecordedAction;
         recordingController.EndRecordingRequested += StopRecording;
         runController.StatusChanged += ReportStatus;
         runController.RunningChanged += SetRunningButtonsState;
@@ -769,7 +772,7 @@ public partial class Form1 : Form
         }
     }
 
-    // ---- Recording via low-level mouse hook ----
+    // ---- Recording via low-level mouse + keyboard hooks ----
     private void ToggleRecording()
     {
         if (recordingController.IsRecording) StopRecording();
@@ -779,18 +782,47 @@ public partial class Form1 : Form
     private void StartRecording()
     {
         if (runController.IsRunning) { lblStatus.Text = "Stop clicking before recording."; return; }
-        if (recordingController.Start(Handle, ReportStatus, MarshalToUi))
+        // Profile hotkeys stop a recording when pressed (WndProc), so their keydowns must
+        // not survive into the recorded sequence as stray Key actions.
+        recordingController.AdditionalFilteredVks.Clear();
+        foreach (Profile p in profileController.Profiles)
+            if (p.HotkeyVk != 0) recordingController.AdditionalFilteredVks.Add(p.HotkeyVk);
+
+        if (recordingController.Start(Handle, hotkeyVk, ReportStatus, MarshalToUi))
         {
+            recordStartCount = points.Count;
             chkSequence.Checked = true;
             btnRecord.Text = "■ Stop recording";
+            lblStatus.Text = "RECORDING: 0 actions — clicks and keys still reach their apps. Right-click or F8 to finish.";
         }
     }
 
     private void StopRecording()
     {
+        long elapsed = recordingController.ElapsedMs;
         recordingController.Stop();
         btnRecord.Text = "● Record clicks";
-        lblStatus.Text = $"Recording finished. {points.Count} actions total.";
+        int recorded = points.Count - recordStartCount;
+        lblStatus.Text = $"Recording finished. {recorded} action{(recorded == 1 ? "" : "s")} in {FormatDuration(elapsed)}.";
+    }
+
+    /// <summary>Appends (or, on a double-click chain, replaces) a freshly recorded action.</summary>
+    private void AddRecordedAction(SeqAction a, bool replacesLast)
+    {
+        if (replacesLast && points.Count > 0) points[^1] = a;
+        else points.Add(a);
+        RefreshList();
+        if (!chkSequence.Checked) chkSequence.Checked = true;
+        lblStatus.Text = $"RECORDING: {points.Count - recordStartCount} actions — clicks and keys still reach their apps. Right-click or F8 to finish.";
+    }
+
+    /// <summary>0..999 ms → "N ms", < 60 s → "N.N s", otherwise "N m N s".</summary>
+    private static string FormatDuration(long ms)
+    {
+        if (ms < 1000) return string.Create(CultureInfo.InvariantCulture, $"{ms} ms");
+        if (ms < 60000) return string.Create(CultureInfo.InvariantCulture, $"{ms / 1000.0:0.#} s");
+        long totalSeconds = ms / 1000;
+        return string.Create(CultureInfo.InvariantCulture, $"{totalSeconds / 60} m {totalSeconds % 60} s");
     }
 
     // ---- Pick location (single-point): countdown then capture cursor ----

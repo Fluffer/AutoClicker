@@ -76,7 +76,19 @@ internal static class Native
         public UIntPtr dwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
     internal delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    internal delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     // ---- SendInput ----
 
@@ -116,8 +128,19 @@ internal static class Native
     // ---- Hooks ----
 
     internal const int WH_MOUSE_LL = 14;
+    internal const int WH_KEYBOARD_LL = 13;
+
     internal const int WM_LBUTTONDOWN_LL = 0x0201;
+    internal const int WM_LBUTTONUP_LL = 0x0202;
     internal const int WM_RBUTTONDOWN_LL = 0x0204;
+    internal const int WM_RBUTTONUP_LL = 0x0205;
+    internal const int WM_MBUTTONDOWN_LL = 0x0207;
+    internal const int WM_MBUTTONUP_LL = 0x0208;
+    internal const int WM_MOUSEWHEEL_LL = 0x020A;
+    internal const int WM_MOUSEHWHEEL_LL = 0x020E;
+
+    /// <summary>KBDLLHOOKSTRUCT.flags bit: the event is a key-up.</summary>
+    internal const uint LLKHF_UP = 0x80;
 
     // ---- Misc ----
 
@@ -167,6 +190,9 @@ internal static class Native
 
     [DllImport("user32.dll")]
     internal static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
     [DllImport("user32.dll")]
     internal static extern bool UnhookWindowsHookEx(IntPtr hhk);
