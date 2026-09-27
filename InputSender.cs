@@ -208,9 +208,10 @@ internal static class InputSender
     /// <summary>
     /// Press at the start point, travel to the end point, release. <paramref name="keepGoing"/>
     /// is polled during the travel so a stop request doesn't have to wait it out — the
-    /// button is released either way.
+    /// button is released either way. When <paramref name="jitterPx"/> is positive, each
+    /// mid-travel point is nudged by a random amount so the path no longer looks machined.
     /// </summary>
-    public static void Drag(int x1, int y1, int x2, int y2, int button, int dragMs, Func<bool> keepGoing)
+    public static void Drag(int x1, int y1, int x2, int y2, int button, int dragMs, Func<bool> keepGoing, int jitterPx = 0)
     {
         var (down, up) = MouseFlags(button);
         // A failed move here would press at the cursor's current location instead of (x1,y1);
@@ -229,7 +230,18 @@ internal static class InputSender
                 // Mid-travel moves are best-effort: a transient failure (rare — secure
                 // desktop aside, SetCursorPos only fails on bad coordinates) shouldn't
                 // abort the drag and strand the button; the final move below is checked.
-                SetCursorPos(Lerp(x1, x2, s, steps), Lerp(y1, y2, s, steps));
+                // Ease-in-out (smoothstep) starts and ends slow, like a human drag, and
+                // per-step jitter (when requested) breaks up the otherwise straight line.
+                double t = s / (double)steps;
+                double eased = t * t * (3.0 - 2.0 * t);
+                int mx = x1 + (int)Math.Round((x2 - x1) * eased);
+                int my = y1 + (int)Math.Round((y2 - y1) * eased);
+                if (jitterPx > 0)
+                {
+                    mx += Random.Shared.Next(-jitterPx, jitterPx + 1);
+                    my += Random.Shared.Next(-jitterPx, jitterPx + 1);
+                }
+                SetCursorPos(mx, my);
                 if (stepMs > 0) Thread.Sleep(stepMs);
             }
             if (!SetCursorPos(x2, y2))

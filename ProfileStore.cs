@@ -76,9 +76,8 @@ internal static class ProfileStore
         }
     }
 
-    /// <summary>Where profiles are read from and written to: <c>%AppData%\AutoClicker\profiles.json</c>.</summary>
-    public static string FilePath { get; internal set; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClicker", "profiles.json");
+    /// <summary>Where profiles are read from and written to: <c>Documents\AutoClicker\profiles.json</c>.</summary>
+    public static string FilePath { get; internal set; } = UserDataPaths.ProfilesPath;
 
     /// <summary>
     /// Loads profiles from <see cref="FilePath"/>. Never throws: a missing, empty, unreadable,

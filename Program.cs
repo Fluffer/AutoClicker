@@ -16,6 +16,10 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        // Move legacy %AppData% data to Documents before any store is read (GUI or CLI),
+        // so MSIX uninstalls stop deleting the user's profiles and settings.
+        UserDataPaths.EnsureMigrated();
+
         if (args.Length == 0)
         {
             using var mutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool createdNew);

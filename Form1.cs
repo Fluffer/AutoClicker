@@ -21,9 +21,15 @@ public partial class Form1 : Form
     private Button btnUp = null!, btnDown = null!, btnSave = null!, btnLoad = null!;
     private Button btnStart = null!, btnStop = null!, btnHotkey = null!;
     private Label lblStatus = null!;
+    private TableLayoutPanel root = null!;
     private NumericUpDown numStartDelay = null!;
     private CheckBox chkPanic = null!;
+    private Button btnPanicKey = null!;
+    private NumericUpDown numMaxRunSeconds = null!;
+    private CheckBox chkCornerFailSafe = null!;
+    private CheckBox chkRunLogging = null!;
     private CheckBox chkMinimizeToTray = null!;
+    private Button btnSchedule = null!;
 
     // ---- Profiles ----
     private CheckBox chkUseProfiles = null!;
@@ -42,6 +48,8 @@ public partial class Form1 : Form
     private int recordStartCount;
     private uint hotkeyVk = 0x75; // F6
     private string hotkeyName = "F6";
+    private uint panicKeyVk = 0x1B; // Esc
+    private string panicKeyName = "Esc";
     private System.Windows.Forms.Timer? pickTimer;
     private int pickCountdown;
     private Action? pickDone;
@@ -57,6 +65,7 @@ public partial class Form1 : Form
     private readonly RecordingController recordingController;
     private readonly ProfileController profileController;
     private readonly RunController runController;
+    private ScheduleWatcher? scheduleWatcher;
 
     public Form1()
     {
@@ -66,14 +75,17 @@ public partial class Form1 : Form
         settings = AppSettings.Load();
         hotkeyVk = settings.HotkeyVk;
         hotkeyName = settings.HotkeyName;
+        panicKeyVk = settings.PanicKeyVk;
+        panicKeyName = settings.PanicKeyName;
 
         hotkeyManager = new HotkeyManager(() => Handle, ReportStatus);
         recordingController = new RecordingController();
         profileController = new ProfileController();
         runController = new RunController(
-            () => hotkeyManager.RegisterPanic(chkPanic.Checked),
+            () => hotkeyManager.RegisterPanic(chkPanic.Checked, panicKeyVk),
             () => hotkeyManager.UnregisterPanic(),
             () => hotkeyName,
+            () => panicKeyName,
             MarshalToUi);
 
         WireEvents();
@@ -82,6 +94,16 @@ public partial class Form1 : Form
 
         ApplySettings();
         UpdateEnabled();
+
+        // Surface the one-time legacy → Documents migration as the session's status line,
+        // so the user knows where their data went.
+        string? migrationNotice = UserDataPaths.TakeMigrationNotice();
+        if (migrationNotice is not null) ReportStatus(migrationNotice);
+
+        // Fires scheduled runs while the app is open; reloads schedules.json every tick, so
+        // edits made in the Schedule dialog are picked up without restarting.
+        scheduleWatcher = new ScheduleWatcher(msg => MarshalToUi(() => ReportStatus(msg)));
+        scheduleWatcher.Start();
     }
 
     private void WireEvents()
@@ -140,6 +162,9 @@ public partial class Form1 : Form
         numJitterPct.Value = settings.JitterPercent;
         numStartDelay.Value = settings.StartDelaySeconds;
         chkPanic.Checked = settings.PanicKeyEnabled;
+        numMaxRunSeconds.Value = Math.Clamp(settings.MaxRunSeconds, (int)numMaxRunSeconds.Minimum, (int)numMaxRunSeconds.Maximum);
+        chkCornerFailSafe.Checked = settings.CornerFailSafe;
+        chkRunLogging.Checked = settings.RunLoggingEnabled;
         chkMinimizeToTray.Checked = settings.MinimizeToTray;
 
         RestoreLastSequence();
@@ -168,6 +193,11 @@ public partial class Form1 : Form
         settings.HotkeyName = hotkeyName;
         settings.StartDelaySeconds = (int)numStartDelay.Value;
         settings.PanicKeyEnabled = chkPanic.Checked;
+        settings.PanicKeyVk = panicKeyVk;
+        settings.PanicKeyName = panicKeyName;
+        settings.CornerFailSafe = chkCornerFailSafe.Checked;
+        settings.MaxRunSeconds = (int)numMaxRunSeconds.Value;
+        settings.RunLoggingEnabled = chkRunLogging.Checked;
         settings.MinimizeToTray = chkMinimizeToTray.Checked;
 
         settings.UseProfiles = chkUseProfiles.Checked;
@@ -217,8 +247,11 @@ public partial class Form1 : Form
         catch (ArgumentException) { }
         catch (IOException) { }
         BuildTrayIcon(); // depends on Icon/Text already being set above
-        FormBorderStyle = FormBorderStyle.FixedSingle;
-        MaximizeBox = false;
+        // Sizable with a maximize button; AutoSize stays on through construction so the
+        // form still sizes itself to its content, then OnShown freezes that size as the
+        // minimum and lets the user grow the window.
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MaximizeBox = true;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Font;
         AutoSize = true;
@@ -226,7 +259,7 @@ public partial class Form1 : Form
         Font = new Font("Segoe UI", 9F);
         Padding = new Padding(10);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, GrowStyle = TableLayoutPanelGrowStyle.AddRows };
+        root = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, GrowStyle = TableLayoutPanelGrowStyle.AddRows };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         Controls.Add(root);
 
@@ -384,7 +417,7 @@ public partial class Form1 : Form
         t.Controls.Add(chkAnchorPoints, 0, 2);
         t.SetColumnSpan(chkAnchorPoints, 2);
 
-        lvPoints = new ListView { View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, Width = 500, Height = 200, Margin = new Padding(3) };
+        lvPoints = new ListView { View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, MultiSelect = true, Width = 500, Height = 200, Margin = new Padding(3) };
         lvPoints.Columns.Add("#", 30);
         lvPoints.Columns.Add("Action", 190);
         lvPoints.Columns.Add("Target", 200);
@@ -404,7 +437,7 @@ public partial class Form1 : Form
         btnRemovePoint = SeqBtn("Remove");
         btnRemovePoint.Click += (_, _) => RemoveSelectedPoint();
         btnClearPoints = SeqBtn("Clear all");
-        btnClearPoints.Click += (_, _) => { points.Clear(); RefreshList(); };
+        btnClearPoints.Click += (_, _) => ClearAllPoints();
         btns.Controls.Add(btnRecord);
         btns.Controls.Add(btnAddCur);
         btns.Controls.Add(btnAddAction);
@@ -485,21 +518,56 @@ public partial class Form1 : Form
         return grp;
     }
 
-    // ===== Start delay + panic key =====
+    // ===== Start delay + panic key + watchdog =====
     private GroupBox BuildRunOptionsGroup()
     {
         var grp = NewGroup("Run options");
-        var flow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, WrapContents = false };
-        flow.Controls.Add(Lbl("Start after"));
+        var t = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill };
+
+        t.Controls.Add(Lbl("Start after"), 0, 0);
+        var delayFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
         numStartDelay = NewNum(0, 300, 0);
-        flow.Controls.Add(numStartDelay);
-        flow.Controls.Add(Lbl("seconds (0 = immediately)"));
-        chkPanic = new CheckBox { Text = "Esc panic-stops the run", AutoSize = true, Checked = true, Margin = new Padding(18, 6, 3, 3) };
-        flow.Controls.Add(chkPanic);
-        chkMinimizeToTray = new CheckBox { Text = "Minimize to tray", AutoSize = true, Margin = new Padding(18, 6, 3, 3) };
-        flow.Controls.Add(chkMinimizeToTray);
-        grp.Controls.Add(flow);
+        delayFlow.Controls.Add(numStartDelay);
+        delayFlow.Controls.Add(Lbl("seconds (0 = immediately)"));
+        t.Controls.Add(delayFlow, 1, 0);
+
+        t.Controls.Add(Lbl("Stop after"), 0, 1);
+        var limitFlow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+        numMaxRunSeconds = NewNum(0, 86400, 0);
+        limitFlow.Controls.Add(numMaxRunSeconds);
+        limitFlow.Controls.Add(Lbl("seconds (0 = unlimited)"));
+        t.Controls.Add(limitFlow, 1, 1);
+
+        chkPanic = new CheckBox { Text = "Panic key stops the run", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkPanic, 0, 2);
+        btnPanicKey = new Button { Text = "Panic key: " + panicKeyName, AutoSize = true, Margin = new Padding(6, 6, 3, 3) };
+        btnPanicKey.Click += (_, _) => RebindPanicKey();
+        t.Controls.Add(btnPanicKey, 1, 2);
+
+        chkCornerFailSafe = new CheckBox { Text = "Corner fail-safe (cursor in a screen corner stops the run)", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkCornerFailSafe, 0, 3);
+        t.SetColumnSpan(chkCornerFailSafe, 2);
+
+        chkMinimizeToTray = new CheckBox { Text = "Minimize to tray", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkMinimizeToTray, 0, 4);
+        t.SetColumnSpan(chkMinimizeToTray, 2);
+
+        chkRunLogging = new CheckBox { Text = "Write a per-step run log (JSONL)", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        t.Controls.Add(chkRunLogging, 0, 5);
+        t.SetColumnSpan(chkRunLogging, 2);
+
+        btnSchedule = new Button { Text = "Schedule…", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
+        btnSchedule.Click += (_, _) => BtnSchedule_Click();
+        t.Controls.Add(btnSchedule, 0, 6);
+
+        grp.Controls.Add(t);
         return grp;
+    }
+
+    private void BtnSchedule_Click()
+    {
+        using var dlg = new ScheduleForm(profileController.Profiles);
+        dlg.ShowDialog(this);
     }
 
     // ===== System tray =====
@@ -542,6 +610,19 @@ public partial class Form1 : Form
         Show();
         WindowState = FormWindowState.Normal;
         Activate();
+    }
+
+    // Once the form has been shown at its auto-sized natural size, freeze that as the
+    // minimum and switch off AutoSize so the user can grow the window (and use Maximize).
+    // The layout itself is left as-is: controls keep their natural size and the extra space
+    // simply appears around them, which is the conservative trade-off for not redoing the
+    // AutoSize-based layout into a full fill/percent layout without a way to test the UI.
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        AutoSize = false;
+        root.AutoSize = false;
+        MinimumSize = new Size(Width, Height);
     }
 
     // Minimizing normally just minimizes to the taskbar; only route to the tray when the
@@ -679,17 +760,33 @@ public partial class Form1 : Form
 
     private void RemoveSelectedPoint()
     {
-        int i = SelectedIndex();
-        if (i < 0) return;
-        points.RemoveAt(i);
+        if (lvPoints.SelectedIndices.Count == 0) return;
+        // Remove every selected row, highest index first so each RemoveAt stays valid.
+        var indices = lvPoints.SelectedIndices.Cast<int>().OrderByDescending(i => i).ToList();
+        foreach (int i in indices) points.RemoveAt(i);
         RefreshList();
+    }
+
+    private void ClearAllPoints()
+    {
+        if (points.Count == 0) return;
+        DialogResult result = MessageBox.Show(this,
+            "Clear the whole sequence? This removes every action from the list.",
+            "Clear sequence", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (result != DialogResult.Yes) return;
+        points.Clear();
+        RefreshList();
+        lblStatus.Text = "Sequence cleared.";
     }
 
     private void MovePoint(int dir)
     {
-        int i = SelectedIndex();
+        // Move acts on a single selection: with several rows selected the direction would
+        // be ambiguous, so require exactly one and ignore multi-select.
+        if (lvPoints.SelectedIndices.Count != 1) return;
+        int i = lvPoints.SelectedIndices[0];
         int j = i + dir;
-        if (i < 0 || j < 0 || j >= points.Count) return;
+        if (j < 0 || j >= points.Count) return;
         (points[i], points[j]) = (points[j], points[i]);
         RefreshList();
         lvPoints.Items[j].Selected = true;
@@ -887,6 +984,51 @@ public partial class Form1 : Form
             lblStatus.Text = $"Ready. Press {hotkeyName} to start/stop.";
             hotkeyManager.RegisterMain(hotkeyVk, hotkeyName);
         }
+    }
+
+    // Rebindable panic key: Esc (default) or any F1-F12, mirroring the hotkey dialog above.
+    // Collisions with the main start/stop hotkey or F8 are rejected with a status line —
+    // RegisterPanic would silently fail to arm either way once those keys are claimed.
+    private void RebindPanicKey()
+    {
+        using var dlg = new Form
+        {
+            Text = "Panic key setting",
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(300, 120),
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+        var lbl = new Label { Text = "Panic key:", Location = new Point(16, 20), AutoSize = true };
+        var cmb = new ComboBox { Location = new Point(160, 16), Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
+        cmb.Items.Add("Esc");
+        for (int i = 1; i <= 12; i++) cmb.Items.Add("F" + i);
+        cmb.SelectedItem = panicKeyName;
+        if (cmb.SelectedIndex < 0) cmb.SelectedIndex = 0;
+        var ok = new Button { Text = "OK", Location = new Point(120, 68), Size = new Size(75, 32), DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Location = new Point(203, 68), Size = new Size(82, 32), DialogResult = DialogResult.Cancel };
+        dlg.Controls.AddRange(new Control[] { lbl, cmb, ok, cancel });
+        dlg.AcceptButton = ok; dlg.CancelButton = cancel;
+        if (dlg.ShowDialog(this) != DialogResult.OK || cmb.SelectedItem is not string name)
+            return;
+
+        uint vk = name == "Esc" ? 0x1Bu : (uint)(0x70 + int.Parse(name.AsSpan(1), CultureInfo.InvariantCulture) - 1);
+        if (vk == hotkeyVk)
+        {
+            lblStatus.Text = $"{name} is already the start/stop hotkey — pick a different panic key.";
+            return;
+        }
+        if (vk == 0x77) // F8 ends recording
+        {
+            lblStatus.Text = "F8 is reserved for ending recording — pick a different panic key.";
+            return;
+        }
+
+        panicKeyVk = vk;
+        panicKeyName = name;
+        btnPanicKey.Text = "Panic key: " + name;
+        lblStatus.Text = $"Panic key set to {name}. It is only active while a run is running.";
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -1186,6 +1328,10 @@ public partial class Form1 : Form
 
         hotkeyManager.UnregisterAll();
 
+        // Stop the scheduler's timer thread before the form is torn down.
+        scheduleWatcher?.Dispose();
+        scheduleWatcher = null;
+
         // Visible = false first, then Dispose: without this a ghost icon lingers in the
         // tray until the user happens to hover over its old location.
         trayIcon.Visible = false;
@@ -1267,6 +1413,9 @@ public partial class Form1 : Form
             HotkeyName = hotkeyName,
             PanicEnabled = chkPanic.Checked,
             RunDescription = runDescription,
+            CornerFailSafe = chkCornerFailSafe.Checked,
+            MaxRunSeconds = (int)numMaxRunSeconds.Value,
+            RunLoggingEnabled = chkRunLogging.Checked,
         };
 
         runController.TryStart(spec);

@@ -25,6 +25,12 @@ public sealed record RunSpec
     public string HotkeyName { get; init; } = "";
     public bool PanicEnabled { get; init; }
     public string RunDescription { get; init; } = "";
+    /// <summary>Stop the run when the cursor is parked in a screen corner (corner fail-safe).</summary>
+    public bool CornerFailSafe { get; init; }
+    /// <summary>Stop the run after this many seconds; 0 = unlimited.</summary>
+    public int MaxRunSeconds { get; init; }
+    /// <summary>Write a per-step JSONL audit trail for this run.</summary>
+    public bool RunLoggingEnabled { get; init; }
 }
 
 /// <summary>
@@ -44,6 +50,7 @@ internal sealed class RunController : IDisposable
     private readonly Func<bool> armPanic;
     private readonly Action disarmPanic;
     private readonly Func<string> hotkeyNameProvider;
+    private readonly Func<string> panicKeyNameProvider;
     private readonly Action<Action> uiMarshal;
 
     private Thread? worker;
@@ -52,14 +59,26 @@ internal sealed class RunController : IDisposable
     private bool panicStopped;
     private System.Windows.Forms.Timer? startDelayTimer;
     private int startDelayCountdown;
+    private readonly System.Diagnostics.Stopwatch runStopwatch = new();
+    private int watchdogSeconds; // 0 = unlimited
+    private bool watchdogTriggered;
+    // Status the run should end on, set by the failure/watchdog paths and consumed by
+    // OnStopped so the worker's own "Stopped. Press ..." line doesn't overwrite it.
+    private string? stopStatus;
+    private bool runLoggingEnabled;
+    private RunLogger? runLogger;
+    private List<SeqAction>? logActions;
+    private int currentPass;
 
-    public RunController(Func<bool> armPanic, Action disarmPanic, Func<string> hotkeyNameProvider, Action<Action> uiMarshal)
+    public RunController(Func<bool> armPanic, Action disarmPanic, Func<string> hotkeyNameProvider,
+        Func<string> panicKeyNameProvider, Action<Action> uiMarshal)
     {
         this.armPanic = armPanic;
         this.disarmPanic = disarmPanic;
         this.hotkeyNameProvider = hotkeyNameProvider;
+        this.panicKeyNameProvider = panicKeyNameProvider;
         this.uiMarshal = uiMarshal;
-        runner = new SequenceRunner(KeepGoing, OnRunnerStep, OnRunnerStepStarting);
+        runner = new SequenceRunner(KeepGoing, OnRunnerStep, OnRunnerStepStarting, OnRunnerPassComplete);
     }
 
     /// <summary>Raised when the status line should change.</summary>
@@ -92,12 +111,16 @@ internal sealed class RunController : IDisposable
         if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return false;
 
         panicStopped = false;
+        stopStatus = null;
+        watchdogTriggered = false;
+        watchdogSeconds = spec.MaxRunSeconds;
+        runLoggingEnabled = spec.RunLoggingEnabled;
         running = true;
         RunningChanged?.Invoke(true);
 
         bool panicArmed = armPanic();
         string panicWarn = spec.PanicEnabled && !panicArmed
-            ? " Esc is already claimed by another app — panic key OFF."
+            ? $" {panicKeyNameProvider()} is already claimed by another app — panic key OFF."
             : "";
 
         // Build the thread now, capturing every run parameter at the moment Start was
@@ -111,7 +134,8 @@ internal sealed class RunController : IDisposable
                 Limited = spec.Limited,
                 Limit = spec.Limit,
                 JitterPixels = spec.JitterPx,
-                JitterPercent = spec.JitterPct
+                JitterPercent = spec.JitterPct,
+                CornerFailSafe = spec.CornerFailSafe
             };
             worker = new Thread(() => RunSequenceWorker(spec.Actions, options)) { IsBackground = true };
         }
@@ -146,13 +170,13 @@ internal sealed class RunController : IDisposable
 
         startDelayCountdown = spec.StartDelaySeconds;
         startDelayTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-        StatusChanged?.Invoke($"Starting in {startDelayCountdown} s... press {spec.HotkeyName} or Esc to cancel.{panicWarn}");
+        StatusChanged?.Invoke($"Starting in {startDelayCountdown} s... press {spec.HotkeyName} or {panicKeyNameProvider()} to cancel.{panicWarn}");
         startDelayTimer.Tick += (_, _) =>
         {
             startDelayCountdown--;
             if (startDelayCountdown > 0)
             {
-                StatusChanged?.Invoke($"Starting in {startDelayCountdown} s... press {spec.HotkeyName} or Esc to cancel.{panicWarn}");
+                StatusChanged?.Invoke($"Starting in {startDelayCountdown} s... press {spec.HotkeyName} or {panicKeyNameProvider()} to cancel.{panicWarn}");
                 return;
             }
             startDelayTimer!.Stop();
@@ -209,6 +233,9 @@ internal sealed class RunController : IDisposable
 
     private void StartWorkerThread()
     {
+        // The watchdog counts from when the worker actually starts — not from when Start
+        // was pressed — so a long start-delay countdown never eats into MaxRunSeconds.
+        runStopwatch.Restart();
         try
         {
             worker!.Start();
@@ -236,9 +263,20 @@ internal sealed class RunController : IDisposable
 
     private void RunSequenceWorker(List<SeqAction> acts, RunOptions options)
     {
+        // The logger is created on the worker thread so its clock starts at run start, and
+        // disposed here so its file is flushed exactly once per run, even on an abort.
+        currentPass = 0;
+        runLogger = runLoggingEnabled ? RunLogger.TryCreate() : null;
+        logActions = runLogger is not null ? acts : null;
         try { runner.RunSequence(acts, options); }
         catch (Exception ex) { ReleaseAfterFailure(ex); }
-        finally { Finish(); }
+        finally
+        {
+            runLogger?.Dispose();
+            runLogger = null;
+            logActions = null;
+            Finish();
+        }
     }
 
     /// <summary>
@@ -251,7 +289,11 @@ internal sealed class RunController : IDisposable
     private void ReleaseAfterFailure(Exception ex)
     {
         InputSender.ReleaseAllButtons();
-        uiMarshal(() => StatusChanged?.Invoke("Stopped — " + ex.Message));
+        // A fail-safe stop is a deliberate, user-triggered stop, not an error — report its
+        // message verbatim (e.g. "Stopped by corner fail-safe.") rather than with the
+        // "Stopped —" error prefix. The status is surfaced by OnStopped (called from
+        // Finish), which runs right after this on the same worker thread.
+        stopStatus = ex is FailSafeException ? ex.Message : "Stopped — " + ex.Message;
     }
 
     // Surfaces the engine's per-step callbacks as events; the form subscribes to drive the
@@ -260,9 +302,40 @@ internal sealed class RunController : IDisposable
 
     // Surfaces the engine's per-step completion (or suppression) as an event; index -1
     // means the run ended and any highlight should be cleared.
-    private void OnRunnerStep(int index, bool performed) => StepCompleted?.Invoke(index, performed);
+    private void OnRunnerStep(int index, bool performed)
+    {
+        LogStep(index, performed);
+        StepCompleted?.Invoke(index, performed);
+    }
 
-    private bool KeepGoing() => running;
+    private void OnRunnerPassComplete() => currentPass++;
+
+    // Appends the step to the run's JSONL audit trail, when logging is on. Runs on the
+    // worker thread (the engine calls onStep synchronously), so no marshalling is needed.
+    private void LogStep(int index, bool performed)
+    {
+        if (runLogger is null || logActions is null || index < 0 || index >= logActions.Count) return;
+        SeqAction a = logActions[index];
+        int? x = null, y = null;
+        if (a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll or ActionKind.WaitPixel)
+        {
+            x = a.X;
+            y = a.Y;
+        }
+        runLogger.Log(currentPass, index, a.Kind.ToString(), a.Describe(), performed, x, y);
+    }
+
+    private bool KeepGoing()
+    {
+        // The watchdog is checked here, on the hot path every action/sleep slice polls, so
+        // a max-run-time stop lands within ~20 ms of the deadline without a second timer.
+        if (running && watchdogSeconds > 0 && runStopwatch.Elapsed.TotalSeconds >= watchdogSeconds)
+        {
+            watchdogTriggered = true;
+            return false;
+        }
+        return running;
+    }
 
     private void Finish()
     {
@@ -279,7 +352,12 @@ internal sealed class RunController : IDisposable
         disarmPanic();
         RunningChanged?.Invoke(false);
         // Confirming the buttons were force-released is the whole point of the panic key,
-        // so don't let the worker's own async "Stopped" message land on top of that.
-        StatusChanged?.Invoke(panicStopped ? PanicMessage : $"Stopped. Press {hotkeyNameProvider()} to start.");
+        // so don't let the worker's own async "Stopped" message land on top of that. A
+        // watchdog stop and a failure/fail-safe stop likewise keep their specific message
+        // instead of the generic "Stopped. Press ..." line.
+        string status = panicStopped ? PanicMessage
+            : watchdogTriggered ? "Watchdog: max run time reached."
+            : stopStatus ?? $"Stopped. Press {hotkeyNameProvider()} to start.";
+        StatusChanged?.Invoke(status);
     }
 }

@@ -21,7 +21,6 @@ internal sealed class HotkeyManager
     // can never collide with the toggle/end-recording/panic hotkeys by id.
     private const int ProfileHotkeyIdBase = 0xB010;
     private const uint VK_F8 = 0x77;
-    private const uint VK_ESCAPE = 0x1B;
 
     private readonly Func<IntPtr> hwndProvider;
     private readonly Action<string> reportStatus;
@@ -93,16 +92,16 @@ internal sealed class HotkeyManager
         UnregisterProfiles();
     }
 
-    // Esc is deliberately NOT registered alongside F6/F8 at startup. RegisterHotKey grabs
-    // the key globally, stealing it from every other app on the machine for as long as this
-    // process is open. That's fine for F6/F8 (uncommon, user-chosen), but Esc is used
-    // constantly elsewhere (closing dialogs, cancelling menus, games). So it is only ever
-    // armed for the duration of an actual run — claimed when a run starts, released when it
-    // stops or the form closes — never at startup.
-    public bool RegisterPanic(bool enabled)
+    // The panic key is deliberately NOT registered at startup. RegisterHotKey grabs the
+    // key globally, stealing it from every other app on the machine for as long as this
+    // process is open — fine for the main hotkey/F8 (uncommon, user-chosen), but the panic
+    // key (Esc by default, any F-key) is used constantly elsewhere (closing dialogs,
+    // cancelling menus, games). So it is only ever armed for the duration of an actual run —
+    // claimed when a run starts, released when it stops or the form closes — never at startup.
+    public bool RegisterPanic(bool enabled, uint panicVk)
     {
         if (!enabled) { panicRegistered = false; return true; } // not requested; not a failure
-        panicRegistered = RegisterHotKey(hwndProvider(), HOTKEY_PANIC, 0, VK_ESCAPE);
+        panicRegistered = RegisterHotKey(hwndProvider(), HOTKEY_PANIC, 0, panicVk);
         return panicRegistered;
     }
 

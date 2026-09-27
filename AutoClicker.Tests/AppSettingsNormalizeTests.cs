@@ -62,4 +62,30 @@ public class AppSettingsNormalizeTests
         Assert.Equal("", s.ActiveProfileName);
         Assert.False(string.IsNullOrEmpty(s.HotkeyName)); // recomputed from the VK, never null
     }
+
+    [Fact]
+    public void Panic_key_defaults_to_esc()
+    {
+        var s = new AppSettings();
+        s.Normalize();
+        Assert.Equal(0x1Bu, s.PanicKeyVk);
+        Assert.Equal("Esc", s.PanicKeyName);
+    }
+
+    [Fact]
+    public void Invalid_panic_key_falls_back_to_esc()
+    {
+        var s = new AppSettings { PanicKeyVk = 0x41 /* 'A' */, PanicKeyName = "A" };
+        s.Normalize();
+        Assert.Equal(0x1Bu, s.PanicKeyVk);
+        Assert.Equal("Esc", s.PanicKeyName);
+    }
+
+    [Fact]
+    public void Panic_key_name_is_recomputed_from_the_vk_not_trusted_from_disk()
+    {
+        var s = new AppSettings { PanicKeyVk = 0x72 /* F3 */, PanicKeyName = "Esc" };
+        s.Normalize();
+        Assert.Equal("F3", s.PanicKeyName);
+    }
 }

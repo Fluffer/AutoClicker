@@ -14,6 +14,9 @@ internal sealed class RunOptions
     public int Limit { get; set; } = 1;
     public int JitterPixels { get; set; }
     public int JitterPercent { get; set; }
+
+    /// <summary>Stop the run when the cursor is parked in a screen corner (opt-in fail-safe).</summary>
+    public bool CornerFailSafe { get; set; }
 }
 
 /// <summary>Parameters for <see cref="SequenceRunner.RunSingle"/>.</summary>
@@ -125,6 +128,13 @@ internal sealed class SequenceRunner
                 {
                     int stepIp = ip;
                     var a = actions[stepIp];
+                    // Corner fail-safe: checked before each foreground mouse action. The
+                    // cursor only moves under our control during foreground clicks/drags/
+                    // scrolls, so those are the only kinds where a user parking it in a
+                    // corner can mean "stop" — and a background run never moves the cursor.
+                    if (options.CornerFailSafe && !options.Background
+                        && a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll)
+                        CheckCornerFailSafe();
                     onStepStarting?.Invoke(stepIp);
                     bool performed = ExecuteStep(a, options, ref lastTarget, ctx, ref ip);
                     onStep?.Invoke(stepIp, performed);
@@ -152,6 +162,13 @@ internal sealed class SequenceRunner
         public Dictionary<string, int> LabelMap { get; }
         public Dictionary<string, VarValue> Variables { get; }
         public Stack<RepeatFrame> Frames { get; } = new();
+
+        /// <summary>
+        /// Set once a foreground click's SendInput has been refused (elevated target window).
+        /// Sticky for the rest of the run: every later foreground click then goes straight to
+        /// PostMessage instead of re-throwing the same way per action.
+        /// </summary>
+        public bool SendInputBlocked { get; set; }
 
         public RunContext(IReadOnlyList<SeqAction> actions)
         {
@@ -261,7 +278,10 @@ internal sealed class SequenceRunner
 
             default:
                 ip++;
-                return Execute(a, options.Background, options.JitterPixels, ref lastTarget, ctx);
+                // Humanization is on when the user asked for either kind of jitter; the
+                // glide path itself is randomized independently of the jitter magnitude.
+                bool humanize = options.JitterPixels > 0 || options.JitterPercent > 0;
+                return Execute(a, options.Background, options.JitterPixels, humanize, ref lastTarget, ctx);
         }
     }
 
@@ -291,7 +311,7 @@ internal sealed class SequenceRunner
     /// delegating — so this method only ever sees input kinds and the wait kinds (WaitPixel,
     /// FindImage, FindText).
     /// </summary>
-    private bool Execute(SeqAction a, bool background, int jitterPx, ref POINT lastTarget, RunContext ctx)
+    private bool Execute(SeqAction a, bool background, int jitterPx, bool humanize, ref POINT lastTarget, RunContext ctx)
     {
         // A gate only applies to ordinary actions — the wait kinds are themselves the wait
         // mechanism, so their Condition means "what to wait for" instead (see SeqAction.Condition).
@@ -319,7 +339,7 @@ internal sealed class SequenceRunner
         }
 
         if (a.Kind is ActionKind.FindImage or ActionKind.FindText)
-            return ExecuteVisualFind(a, background, jitterPx, ref lastTarget, ctx);
+            return ExecuteVisualFind(a, background, jitterPx, humanize, ref lastTarget, ctx);
 
         bool positioned = a.Kind is ActionKind.Click or ActionKind.Drag or ActionKind.Scroll;
         int x = a.X, y = a.Y, ex = a.EndX, ey = a.EndY;
@@ -351,21 +371,21 @@ internal sealed class SequenceRunner
         switch (a.Kind)
         {
             case ActionKind.Click:
-                DispatchClick(a, x, y, method);
+                DispatchClick(a, x, y, method, humanize, ctx);
                 break;
 
             case ActionKind.Drag:
                 // UI Automation has no drag primitive -- "invoke a control" doesn't generalize to
                 // a gesture -- so method 2 falls back to PostMessage rather than doing nothing.
                 if (method != 0) InputSender.BackgroundDrag(x, y, ex, ey, a.Button, a.DragMs, keepGoing);
-                else InputSender.Drag(x, y, ex, ey, a.Button, a.DragMs, keepGoing);
+                else InputSender.Drag(x, y, ex, ey, a.Button, a.DragMs, keepGoing, jitterPx);
                 break;
 
             case ActionKind.Scroll:
                 // Same reasoning as Drag: no UIA equivalent for a wheel notch, so method 2 also
                 // falls back to PostMessage.
                 if (method != 0) InputSender.BackgroundScroll(x, y, a.ScrollNotches, a.Horizontal);
-                else { MoveToOrFail(x, y); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
+                else { MoveCursorTo(x, y, humanize); InputSender.Scroll(a.ScrollNotches, a.Horizontal); }
                 break;
 
             case ActionKind.Key:
@@ -391,8 +411,14 @@ internal sealed class SequenceRunner
     /// FindText click-on-found goes through the identical backend resolution (real input,
     /// background messages, or UI Automation) as an ordinary click.
     /// </summary>
-    private void DispatchClick(SeqAction a, int x, int y, int method)
+    private void DispatchClick(SeqAction a, int x, int y, int method, bool humanize, RunContext ctx)
     {
+        // Sticky SendInput-blocked memory (see RunContext.SendInputBlocked): once a
+        // SendInput click has been refused by an elevated foreground window, every later
+        // foreground click goes straight to PostMessage. Retrying SendInput per action
+        // would just re-block and throw on every single step of the run.
+        if (ctx.SendInputBlocked && method == 0) method = 1;
+
         if (method == 2)
         {
             // Soft failure by design: TryInvokeAt returns false when there's simply no
@@ -407,7 +433,23 @@ internal sealed class SequenceRunner
         // keepGoing is threaded through so a long HoldMs doesn't make Stop and the
         // panic key wait out the whole hold before taking effect.
         else if (method == 1) InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
-        else { MoveToOrFail(x, y); InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing); }
+        else
+        {
+            MoveCursorTo(x, y, humanize);
+            try
+            {
+                InputSender.Click(a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+            }
+            catch (Win32Exception)
+            {
+                // SendInput was blocked (the target window is probably elevated). Fall
+                // back one rung down the ladder to PostMessage for this click and
+                // remember it for the rest of the run — the fallback doesn't throw.
+                ctx.SendInputBlocked = true;
+                if (NextBackendOnFailure(0) == 1)
+                    InputSender.BackgroundClick(x, y, a.Button, a.DoubleClick, a.HoldMs, keepGoing);
+            }
+        }
     }
 
     /// <summary>
@@ -419,7 +461,7 @@ internal sealed class SequenceRunner
     /// <see cref="SeqAction.AbortRunOnTimeout"/> is set, otherwise report not-performed like a
     /// failed gate.
     /// </summary>
-    private bool ExecuteVisualFind(SeqAction a, bool background, int jitterPx, ref POINT lastTarget, RunContext ctx)
+    private bool ExecuteVisualFind(SeqAction a, bool background, int jitterPx, bool humanize, ref POINT lastTarget, RunContext ctx)
     {
         // Decode the template once, before the wait, so a corrupt PNG fails immediately
         // instead of after the whole timeout has elapsed.
@@ -460,7 +502,7 @@ internal sealed class SequenceRunner
                     int cy = p.Y + a.ClickOffsetY;
                     if (jitterPx > 0) { cx += JitterPx(jitterPx); cy += JitterPx(jitterPx); }
                     lastTarget = new POINT { X = cx, Y = cy };
-                    DispatchClick(a, cx, cy, ResolveClickMethod(a.ClickMethod, background));
+                    DispatchClick(a, cx, cy, ResolveClickMethod(a.ClickMethod, background), humanize, ctx);
                 }
                 return true;
             }
@@ -518,7 +560,43 @@ internal sealed class SequenceRunner
         return method == 2 && !UiaInvoker.IsAvailable ? 0 : method;
     }
 
+    /// <summary>
+    /// The backend to try next when a click on <paramref name="method"/> fails. The ladder
+    /// runs 2 (UI Automation) → 1 (PostMessage) → 0 (SendInput), and a blocked SendInput
+    /// wraps back to 1: each rung falls back toward the least fussy option that still does
+    /// something. Today only the 0 → 1 rung is exercised in code — it is the only failure
+    /// that surfaces as a <see cref="Win32Exception"/>. Extracted as a pure function so the
+    /// policy is unit-testable without driving a real SendInput failure.
+    /// </summary>
+    internal static int NextBackendOnFailure(int method) => method switch
+    {
+        2 => 1,
+        1 => 0,
+        _ => 1,
+    };
+
     private static POINT CursorPos() { GetCursorPos(out POINT p); return p; }
+
+    /// <summary>
+    /// Throws <see cref="FailSafeException"/> when the cursor is within a few pixels of any
+    /// screen corner — the classic "slam the mouse into a corner to stop everything"
+    /// fail-safe. One GetCursorPos P/Invoke per foreground mouse action, deliberately cheap.
+    /// </summary>
+    private static void CheckCornerFailSafe()
+    {
+        const int margin = 4;
+        GetCursorPos(out POINT p);
+        var s = SystemInformation.VirtualScreen;
+
+        bool inCorner =
+            (p.X <= s.Left + margin && p.Y <= s.Top + margin) ||
+            (p.X <= s.Left + margin && p.Y >= s.Bottom - margin) ||
+            (p.X >= s.Right - margin && p.Y <= s.Top + margin) ||
+            (p.X >= s.Right - margin && p.Y >= s.Bottom - margin);
+
+        if (inCorner)
+            throw new FailSafeException("Stopped by corner fail-safe.");
+    }
 
     /// <summary>
     /// Moves the real cursor, aborting the step when the move fails. An unchecked
@@ -532,6 +610,50 @@ internal sealed class SequenceRunner
             throw new Win32Exception(Marshal.GetLastWin32Error(),
                 $"Could not move the cursor to {x},{y} — the click would have landed at the wrong position.");
     }
+
+    /// <summary>
+    /// Moves the real cursor to (x,y): glides along a natural path when humanization is on,
+    /// and teleports (the pre-humanization behavior) otherwise.
+    /// </summary>
+    private void MoveCursorTo(int x, int y, bool glide)
+    {
+        if (glide) GlideCursorTo(x, y);
+        else MoveToOrFail(x, y);
+    }
+
+    /// <summary>
+    /// Glides the cursor from its current position to (x,y) along a WindMouse-style path.
+    /// The glide is short (distance-derived duration, 20-120 ms) and interruptible, so a
+    /// Stop or panic never waits it out. The final position is snapped exactly to (x,y)
+    /// and checked, mirroring <see cref="MoveToOrFail"/>'s failure semantics.
+    /// </summary>
+    private void GlideCursorTo(int x, int y)
+    {
+        GetCursorPos(out POINT cur);
+        if (cur.X == x && cur.Y == y) return;
+
+        var from = new Point(cur.X, cur.Y);
+        var to = new Point(x, y);
+        int durationMs = Math.Clamp(Distance(from, to) / 2, 20, 120);
+
+        var pts = MousePathGenerator.Path(from, to, Random.Shared).ToList();
+        if (pts.Count < 2) { MoveToOrFail(x, y); return; }
+
+        int stepMs = durationMs / (pts.Count - 1);
+        for (int i = 1; i < pts.Count - 1; i++)
+        {
+            if (!keepGoing()) return; // stopped: the run is ending, so don't keep moving
+            SetCursorPos(pts[i].X, pts[i].Y); // mid-glide moves are best-effort, like Drag's
+            if (stepMs > 0) InterruptibleSleep(stepMs);
+        }
+
+        if (!SetCursorPos(x, y))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                $"Could not move the cursor to {x},{y} — the click would have landed at the wrong position.");
+    }
+
+    private static int Distance(Point a, Point b) =>
+        (int)Math.Round(Math.Sqrt((long)(b.X - a.X) * (b.X - a.X) + (long)(b.Y - a.Y) * (b.Y - a.Y)));
 
     // Waits `ms`, but bails out early once `keepGoing` goes false.
     // Measured against a Stopwatch rather than by accumulating fixed steps: the old

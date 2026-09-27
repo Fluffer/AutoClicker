@@ -41,6 +41,19 @@ public sealed class AppSettings
     public int StartDelaySeconds { get; set; }
     public bool PanicKeyEnabled { get; set; } = true;
 
+    /// <summary>Virtual-key code of the panic key. Esc (0x1B) by default; F1-F12 also allowed.</summary>
+    public uint PanicKeyVk { get; set; } = DefaultPanicKeyVk;
+    public string PanicKeyName { get; set; } = DefaultPanicKeyName;
+
+    /// <summary>Stop the run when the cursor is parked in a screen corner (classic PyAutoGUI-style fail-safe).</summary>
+    public bool CornerFailSafe { get; set; } = true;
+
+    /// <summary>Stop the run after this many seconds. 0 = unlimited.</summary>
+    public int MaxRunSeconds { get; set; }
+
+    /// <summary>Write a per-step JSONL audit trail for each run (off by default).</summary>
+    public bool RunLoggingEnabled { get; set; }
+
     /// <summary>Minimising hides to the tray instead of the taskbar.</summary>
     public bool MinimizeToTray { get; set; }
     public string LastSequencePath { get; set; } = "";
@@ -55,12 +68,14 @@ public sealed class AppSettings
     private const uint MaxFunctionKeyVk = 0x7B; // F12
     private const uint DefaultHotkeyVk = 0x75; // F6
     private const string DefaultHotkeyName = "F6";
+    private const uint EscapeKeyVk = 0x1B; // Esc
+    private const uint DefaultPanicKeyVk = EscapeKeyVk;
+    private const string DefaultPanicKeyName = "Esc";
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    /// <summary>Where settings are read from and written to: <c>%AppData%\AutoClicker\settings.json</c>.</summary>
-    public static string FilePath { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoClicker", "settings.json");
+    /// <summary>Where settings are read from and written to: <c>Documents\AutoClicker\settings.json</c>.</summary>
+    public static string FilePath { get; } = UserDataPaths.SettingsPath;
 
     /// <summary>
     /// Loads settings from <see cref="FilePath"/>. Never throws: a missing, empty, unreadable,
@@ -124,10 +139,12 @@ public sealed class AppSettings
         JitterPixels = Math.Clamp(JitterPixels, 0, 500);
         JitterPercent = Math.Clamp(JitterPercent, 0, 100);
         StartDelaySeconds = Math.Clamp(StartDelaySeconds, 0, 300);
+        MaxRunSeconds = Math.Max(0, MaxRunSeconds);
         PickedX = Math.Clamp(PickedX, -100_000, 100_000);
         PickedY = Math.Clamp(PickedY, -100_000, 100_000);
 
         HotkeyName ??= "";
+        PanicKeyName ??= "";
         LastSequencePath ??= "";
         ActiveProfileName ??= "";
 
@@ -141,8 +158,23 @@ public sealed class AppSettings
             string expected = FunctionKeyName(HotkeyVk);
             if (HotkeyName != expected) HotkeyName = expected;
         }
+
+        // Panic key: Esc or F1-F12. Anything else collapses to Esc (the default).
+        if (PanicKeyVk != EscapeKeyVk && (PanicKeyVk < MinFunctionKeyVk || PanicKeyVk > MaxFunctionKeyVk))
+        {
+            PanicKeyVk = DefaultPanicKeyVk;
+            PanicKeyName = DefaultPanicKeyName;
+        }
+        else
+        {
+            string expected = PanicKeyLabel(PanicKeyVk);
+            if (PanicKeyName != expected) PanicKeyName = expected;
+        }
     }
 
     private static string FunctionKeyName(uint vk) =>
         "F" + (vk - MinFunctionKeyVk + 1).ToString(CultureInfo.InvariantCulture);
+
+    private static string PanicKeyLabel(uint vk) =>
+        vk == EscapeKeyVk ? "Esc" : FunctionKeyName(vk);
 }
