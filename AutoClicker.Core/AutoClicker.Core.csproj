@@ -19,10 +19,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The engine types are internal by design: only the UI and CLI are "public".
-         The WinForms exe and the test project both consume them directly. -->
+    <!-- The engine types are internal by design: only the UIs and CLI are "public".
+         The WinForms exe, the WinUI 3 port (M1+) and the test project all consume
+         them directly. -->
     <InternalsVisibleTo Include="AutoClicker" />
     <InternalsVisibleTo Include="AutoClicker.Tests" />
+    <InternalsVisibleTo Include="AutoClicker.WinUI" />
   </ItemGroup>
 
 </Project>

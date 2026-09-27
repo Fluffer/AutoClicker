@@ -32,6 +32,12 @@
          this the exe would compile the engine sources a second time (duplicate types). -->
     <Compile Remove="AutoClicker.Core\**" />
     <None Remove="AutoClicker.Core\**" />
+    <!-- Same again for the WinUI 3 shell (task M1). It lives at the repo root but is its own
+         project; without this the exe would also try to compile App.xaml.cs / MainWindow.xaml.cs
+         and their generated obj\ outputs. No <ProjectReference> is added here on purpose -
+         nothing in the shipping WinForms app may depend on the WinUI project. -->
+    <Compile Remove="AutoClicker.WinUI\**" />
+    <None Remove="AutoClicker.WinUI\**" />
   </ItemGroup>
 
   <ItemGroup>

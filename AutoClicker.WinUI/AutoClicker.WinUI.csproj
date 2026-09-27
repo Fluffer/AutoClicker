@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Task M1: minimal WinUI 3 (Windows App SDK) skeleton. Nothing from the engine is
+         used yet — the ProjectReference below exists purely to prove that a WinUI TFM can
+         reference the net10.0-windows10.0.17763.0 WinForms-based engine library, so the
+         M2+ port has a working projection/reference chain from day one.
+
+         19041 (2004) is the WinAppSDK-era TFM; TargetPlatformMinVersion stays at 17763 to
+         match packaging\AppxManifest.xml's TargetDeviceFamily MinVersion exactly, same as
+         AutoClicker.csproj / AutoClicker.Core.csproj. -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>AutoClicker.WinUI</RootNamespace>
+    <AssemblyName>AutoClicker.WinUI</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+
+    <!-- WinUI 3 plumbing. UseWinUI=true is what pulls Microsoft.UI.Xaml + the XAML markup
+         compiler targets in from the WindowsAppSDK package (and auto-globs App.xaml as the
+         ApplicationDefinition, so no hand-written Main is required). -->
+    <UseWinUI>true</UseWinUI>
+
+    <!-- Unpackaged: run straight from bin\Debug|Release with no MSIX install, no
+         Add-AppxPackage, no developer-mode registration. -->
+    <WindowsPackageType>None</WindowsPackageType>
+
+    <!-- Self-contained Windows App SDK + self-contained .NET runtime. The engine library
+         needs Microsoft.WindowsDesktop.App, and this machine has no framework-dependent
+         runtime resolvable for an apphost outside %USERPROFILE%\.dotnet, so both flags are
+         on. Result: bin\...\AutoClicker.WinUI.exe runs on a machine with NO installed
+         Windows App Runtime. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+
+    <!-- Same analyzer bar as AutoClicker.csproj / AutoClicker.Core.csproj: 0 warnings. -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Latest stable 2.x line. WinUI 3 / Windows App SDK 2.5.1 (there is no WinUI 4).
+         This is a meta-package: it fans out to Microsoft.WindowsAppSDK.{Base,Foundation,
+         InteractiveExperiences,WinUI,DWrite,Widgets,AI,ML,Search,Runtime}. The version
+         cannot be pinned per-subpackage from here. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Not consumed yet (M1 = skeleton). Kept so the reference/projection chain is proven
+         now rather than at the start of M2. -->
+    <ProjectReference Include="..\AutoClicker.Core\AutoClicker.Core.csproj" />
+  </ItemGroup>
+
+</Project>
