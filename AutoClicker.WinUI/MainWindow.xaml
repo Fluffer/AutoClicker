@@ -3,12 +3,547 @@
     x:Class="AutoClicker.WinUI.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Auto Clicker (WinUI)">
-    <Grid>
-        <TextBlock
-            HorizontalAlignment="Center"
-            VerticalAlignment="Center"
-            Style="{StaticResource SubtitleTextBlockStyle}"
-            Text="WinUI 3 skeleton — UI port lands here" />
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Auto Clicker">
+
+    <!--
+        M2a = LAYOUT ONLY. This is the WinUI 3 twin of Form1.BuildUi's row order:
+        toolbar / [scrollable sections] / status row. Interactivity lands in M2b; the
+        click handlers below are empty stubs so the markup compiles clean.
+
+        Three deliberate WinUI-native replacements for WinForms mechanisms:
+          * CollapsibleSection's glyph hack     ->  Microsoft.UI.Xaml.Controls.Expander
+          * ListView (View.Details)             ->  ListView + Grid ItemTemplate
+                                                   (WinUI has no details/list columns;
+                                                    a Grid gives full control)
+          * ToolStrip / StatusStrip             ->  CommandBar + a Grid status row
+                                                   (WinUI has no AutoSize: see sizing
+                                                    code in MainWindow.xaml.cs)
+    -->
+    <Grid x:Name="Root">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- ===== Row 0: toolbar (mirrors BuildToolStrip's item order) =====
+             Note: a native CommandBar lays its primary commands out to the LEFT of its
+             permanent "..." overflow button, i.e. right-aligned in the bar. That is the
+             WinUI idiom; HorizontalContentAlignment has no effect on it. ===== -->
+        <CommandBar
+            x:Name="Toolbar"
+            Grid.Row="0"
+            DefaultLabelPosition="Right"
+            IsOpen="False"
+            HorizontalAlignment="Stretch">
+            <CommandBar.PrimaryCommands>
+                <!-- Record / Play keep the WinForms red / green tint (Foreground tints both
+                     the glyph and the label in the AppBarButton template). -->
+                <AppBarButton x:Name="RecordButton" Label="Record" Foreground="#D13438" Click="OnRecordClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE722;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton x:Name="PlayButton" Label="Play" Foreground="#107C10" Click="OnPlayClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE768;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton x:Name="StopToolbarButton" Label="Stop" IsEnabled="False" Click="OnStopClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE71A;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton x:Name="PauseButton" Label="Pause" IsEnabled="False" Click="OnPauseClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE769;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton x:Name="StepButton" Label="Step" IsEnabled="False" Click="OnStepClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE76C;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarSeparator />
+                <AppBarButton x:Name="AddButton" Label="Add">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE710;" />
+                    </AppBarButton.Icon>
+                    <AppBarButton.Flyout>
+                        <!-- Same five groups, same leaves, same order as Form1's SubMenu
+                             calls (Add -> Mouse / Keyboard / Timing / Visual / Flow). -->
+                        <MenuFlyout Placement="Bottom">
+                            <MenuFlyoutSubItem Text="Mouse">
+                                <MenuFlyoutItem Text="Click" Tag="Click" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Drag" Tag="Drag" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Scroll" Tag="Scroll" Click="OnAddActionClick" />
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem Text="Keyboard">
+                                <MenuFlyoutItem Text="Key press" Tag="Key" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Type text" Tag="Text" Click="OnAddActionClick" />
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem Text="Timing">
+                                <MenuFlyoutItem Text="Wait" Tag="Wait" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Wait for pixel" Tag="WaitPixel" Click="OnAddActionClick" />
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem Text="Visual">
+                                <MenuFlyoutItem Text="Find image" Tag="FindImage" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Find text" Tag="FindText" Click="OnAddActionClick" />
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem Text="Flow">
+                                <MenuFlyoutItem Text="Repeat (loop)" Tag="Repeat" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="If (conditional)" Tag="IfElse" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Else" Tag="Else" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Set variable" Tag="SetVar" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Label" Tag="Label" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Goto label" Tag="GotoLabel" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Break loop" Tag="Break" Click="OnAddActionClick" />
+                                <MenuFlyoutItem Text="Breakpoint" Tag="Breakpoint" Click="OnAddActionClick" />
+                            </MenuFlyoutSubItem>
+                        </MenuFlyout>
+                    </AppBarButton.Flyout>
+                </AppBarButton>
+                <AppBarSeparator />
+                <AppBarButton x:Name="SaveButton" Label="Save" Click="OnSaveClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE74E;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton x:Name="LoadButton" Label="Load" Click="OnLoadClick">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE8E5;" />
+                    </AppBarButton.Icon>
+                </AppBarButton>
+            </CommandBar.PrimaryCommands>
+        </CommandBar>
+
+        <!-- ===== Row 1: the sections. WinUI has no AutoSize, so this scrolls. ===== -->
+        <ScrollViewer
+            x:Name="SectionScroll"
+            Grid.Row="1"
+            VerticalScrollBarVisibility="Auto"
+            VerticalScrollMode="Auto"
+            HorizontalScrollBarVisibility="Auto"
+            HorizontalScrollMode="Auto">
+            <StackPanel
+                x:Name="SectionStack"
+                Padding="12,8,12,12"
+                Spacing="8"
+                HorizontalAlignment="Stretch">
+
+                <!-- Click interval -->
+                <Expander x:Name="IntervalExpander" HorizontalContentAlignment="Left" Header="Click interval (default wait between clicks)" HorizontalAlignment="Stretch">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <NumberBox x:Name="HoursBox" Width="96" Minimum="0" Maximum="999" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                        <TextBlock Text="hours" VerticalAlignment="Center" />
+                        <NumberBox x:Name="MinutesBox" Width="96" Minimum="0" Maximum="59" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                        <TextBlock Text="mins" VerticalAlignment="Center" />
+                        <NumberBox x:Name="SecondsBox" Width="96" Minimum="0" Maximum="59" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                        <TextBlock Text="secs" VerticalAlignment="Center" />
+                        <NumberBox x:Name="MillisecondsBox" Width="96" Minimum="0" Maximum="999" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                        <TextBlock Text="milliseconds" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Expander>
+
+                <!-- Click options + Click repeat (side by side, one shared collapse key) -->
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Expander x:Name="OptionsExpander" HorizontalContentAlignment="Left" Grid.Column="0" Header="Click options" HorizontalAlignment="Stretch">
+                        <Grid ColumnSpacing="8" RowSpacing="6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Mouse button:" VerticalAlignment="Center" />
+                            <ComboBox x:Name="MouseButtonCombo" Grid.Row="0" Grid.Column="1" HorizontalAlignment="Stretch">
+                                <ComboBoxItem Content="Left" />
+                                <ComboBoxItem Content="Right" />
+                                <ComboBoxItem Content="Middle" />
+                            </ComboBox>
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Click type:" VerticalAlignment="Center" />
+                            <ComboBox x:Name="ClickTypeCombo" Grid.Row="1" Grid.Column="1" HorizontalAlignment="Stretch">
+                                <ComboBoxItem Content="Single" />
+                                <ComboBoxItem Content="Double" />
+                                <ComboBoxItem Content="Hold (press &amp; hold)" />
+                            </ComboBox>
+                        </Grid>
+                    </Expander>
+
+                    <Expander x:Name="RepeatExpander" HorizontalContentAlignment="Left" Grid.Column="1" Header="Click repeat" HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="6">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <RadioButton x:Name="RepeatNRadio" GroupName="RepeatMode" Content="Repeat" VerticalAlignment="Center" />
+                                <NumberBox x:Name="RepeatCountBox" Width="110" Minimum="1" Maximum="1000000" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                                <TextBlock Text="times" VerticalAlignment="Center" />
+                            </StackPanel>
+                            <RadioButton x:Name="RepeatUntilRadio" GroupName="RepeatMode" Content="Repeat until stopped" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Expander>
+                </Grid>
+
+                <!-- Cursor position + Humanize (side by side, one shared collapse key) -->
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Expander x:Name="CursorExpander" HorizontalContentAlignment="Left" Grid.Column="0" Header="Cursor position (single-point mode)" HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="6">
+                            <RadioButton x:Name="CurrentLocationRadio" GroupName="CursorMode" Content="Current location" VerticalAlignment="Center" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <RadioButton x:Name="PickRadio" GroupName="CursorMode" Content="Pick:" VerticalAlignment="Center" />
+                                <Button x:Name="PickLocationButton" Content="Pick location" Click="OnPickLocationClick" />
+                                <TextBlock Text="X" VerticalAlignment="Center" />
+                                <NumberBox x:Name="XBox" Width="96" Minimum="-100000" Maximum="100000" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                                <TextBlock Text="Y" VerticalAlignment="Center" />
+                                <NumberBox x:Name="YBox" Width="96" Minimum="-100000" Maximum="100000" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Expander>
+
+                    <Expander x:Name="HumanizeExpander" HorizontalContentAlignment="Left" Grid.Column="1" Header="Humanize" HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="6">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <TextBlock Text="Position jitter:" VerticalAlignment="Center" />
+                                <NumberBox x:Name="JitterPixelsBox" Width="96" Minimum="0" Maximum="500" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                                <TextBlock Text="&#x00B1; px" VerticalAlignment="Center" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <TextBlock Text="Timing jitter:" VerticalAlignment="Center" />
+                                <NumberBox x:Name="JitterPercentBox" Width="96" Minimum="0" Maximum="100" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                                <TextBlock Text="&#x00B1; %" VerticalAlignment="Center" />
+                            </StackPanel>
+                            <TextBlock
+                                Text="0 = perfectly regular. Applies to clicks and waits."
+                                TextWrapping="Wrap"
+                                Opacity="0.6" />
+                        </StackPanel>
+                    </Expander>
+                </Grid>
+
+                <!-- Sequence. Always expanded (see OnSequenceExpanderCollapsed); its key is
+                     deliberately never persisted, exactly like the WinForms original, which
+                     never added "sequence" to its sections list. -->
+                <Expander x:Name="SequenceExpander" HorizontalContentAlignment="Left" Header="Sequence (clicks, drags, scrolls, keystrokes)" IsExpanded="True" Collapsed="OnSequenceExpanderCollapsed" HorizontalAlignment="Stretch">
+                    <Grid ColumnSpacing="8" RowSpacing="6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Grid.Row="0" Grid.ColumnSpan="2" Spacing="2">
+                            <CheckBox x:Name="UseSequenceCheck" Content="Use sequence (runs each action in order, then repeats)" />
+                            <CheckBox x:Name="BackgroundModeCheck" Content="Background mode &#x2014; send input to the window under each point, don't move my cursor (experimental)" />
+                            <CheckBox x:Name="AnchorPointsCheck" Content="Anchor new points to their window &#x2014; survives the window being moved or reopened" />
+                        </StackPanel>
+
+                        <!-- List host: static header row + ListView + empty-state overlay.
+                             Every column is fixed-or-star (never Auto) so the header and each
+                             row share identical widths and stay in lockstep; the spec's "160"
+                             token is folded into the two star columns. -->
+                        <Border
+                            Grid.Row="1"
+                            Grid.Column="0"
+                            BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Height="220">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Grid.Row="0" Padding="8,4" Background="{ThemeResource SubtleFillColorSecondaryBrush}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="40" />
+                                        <ColumnDefinition Width="1.6*" />
+                                        <ColumnDefinition Width="1.1*" />
+                                        <ColumnDefinition Width="80" />
+                                        <ColumnDefinition Width="140" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="#" FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="1" Text="Action" FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="2" Text="Target" FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="3" Text="Wait ms" FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="4" Text="Comment" FontWeight="SemiBold" />
+                                </Grid>
+
+                                <ListView
+                                    x:Name="SequenceList"
+                                    Grid.Row="1"
+                                    SelectionMode="Extended"
+                                    Background="Transparent">
+                                    <ListView.ItemContainerStyle>
+                                        <Style TargetType="ListViewItem">
+                                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                            <Setter Property="Padding" Value="0" />
+                                            <Setter Property="MinHeight" Value="0" />
+                                        </Style>
+                                    </ListView.ItemContainerStyle>
+                                    <ListView.ItemsPanel>
+                                        <!-- WinUI's ListView already defaults to a
+                                             VirtualizingStackPanel; stated explicitly so
+                                             the panel is on the record (and can't drift). -->
+                                        <ItemsPanelTemplate>
+                                            <VirtualizingStackPanel />
+                                        </ItemsPanelTemplate>
+                                    </ListView.ItemsPanel>
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="{Binding Tint}" Padding="8,3">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="40" />
+                                                        <ColumnDefinition Width="1.6*" />
+                                                        <ColumnDefinition Width="1.1*" />
+                                                        <ColumnDefinition Width="80" />
+                                                        <ColumnDefinition Width="140" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="{Binding Index}" TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Grid.Column="1" Text="{Binding Action}" TextTrimming="CharacterEllipsis" Margin="0,0,8,0" />
+                                                    <TextBlock Grid.Column="2" Text="{Binding Target}" TextTrimming="CharacterEllipsis" Margin="0,0,8,0" />
+                                                    <TextBlock Grid.Column="3" Text="{Binding Delay}" />
+                                                    <TextBlock Grid.Column="4" Text="{Binding Comment}" TextTrimming="CharacterEllipsis" />
+                                                </Grid>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                    <ListView.ContextFlyout>
+                                        <MenuFlyout>
+                                            <MenuFlyoutItem Text="Run from here" Click="OnRunFromHereClick" />
+                                            <MenuFlyoutItem Text="Run selection" Click="OnRunSelectionClick" />
+                                            <MenuFlyoutSeparator />
+                                            <MenuFlyoutItem Text="Insert breakpoint" Click="OnInsertBreakpointClick" />
+                                            <MenuFlyoutSeparator />
+                                            <MenuFlyoutItem Text="Find&#x2026;" Click="OnFindClick" />
+                                        </MenuFlyout>
+                                    </ListView.ContextFlyout>
+                                </ListView>
+
+                                <!-- Empty state. Sits in the same grid cell as the list - so it
+                                     starts BELOW the header, unlike WinForms' painted overlay -
+                                     and is collapsed the moment there is a row. -->
+                                <StackPanel
+                                    x:Name="EmptyOverlay"
+                                    Grid.Row="1"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    Spacing="6"
+                                    Visibility="Collapsed">
+                                    <TextBlock
+                                        Text="No actions yet &#x2014; press Record, click Add &#x25BE;, or load a saved sequence."
+                                        TextAlignment="Center"
+                                        TextWrapping="Wrap" />
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="12">
+                                        <HyperlinkButton Content="Record" Padding="4,0" Click="OnRecordClick" />
+                                        <HyperlinkButton Content="Load&#x2026;" Padding="4,0" Click="OnLoadClick" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <StackPanel Grid.Row="0" Grid.RowSpan="2" Grid.Column="1" Spacing="4" VerticalAlignment="Top">
+                            <Button Content="&#x25CF; Record clicks" MinWidth="138" HorizontalAlignment="Stretch" Click="OnRecordClick" />
+                            <Button Content="Add cursor pos" MinWidth="138" HorizontalAlignment="Stretch" Click="OnAddCursorPosClick" />
+                            <Button Content="Add action&#x2026;" MinWidth="138" HorizontalAlignment="Stretch" Click="OnAddActionMenuClick" />
+                            <Button Content="Edit&#x2026;" MinWidth="138" HorizontalAlignment="Stretch" Click="OnEditRowClick" />
+                            <Button Content="Remove" MinWidth="138" HorizontalAlignment="Stretch" Click="OnRemoveRowClick" />
+                            <Button Content="Clear all" MinWidth="138" HorizontalAlignment="Stretch" Click="OnClearRowsClick" />
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="2" Grid.ColumnSpan="2" Orientation="Horizontal" Spacing="4">
+                            <Button Content="Move up &#x25B2;" Click="OnMoveUpClick" />
+                            <Button Content="Move down &#x25BC;" Click="OnMoveDownClick" />
+                            <Button Content="Save sequence&#x2026;" Click="OnSaveClick" />
+                            <Button Content="Load sequence&#x2026;" Click="OnLoadClick" />
+                        </StackPanel>
+
+                        <TextBlock
+                            Grid.Row="3"
+                            Grid.ColumnSpan="2"
+                            TextWrapping="Wrap"
+                            Opacity="0.6"
+                            Text="Record: click each target (right-click or F8 to finish). Double-click a row to edit it. &quot;Add action&#x2026;&quot; adds drags, scroll and keystrokes." />
+                    </Grid>
+                </Expander>
+
+                <!-- Profiles -->
+                <Expander x:Name="ProfilesExpander" HorizontalContentAlignment="Left" Header="Profiles (switch between several named sequences)" HorizontalAlignment="Stretch">
+                    <StackPanel Spacing="6">
+                        <CheckBox x:Name="UseProfilesCheck" Content="Use profiles" />
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="Profile:" VerticalAlignment="Center" />
+                            <ComboBox x:Name="ProfileCombo" Width="180" />
+                            <Button Content="New" MinWidth="138" Click="OnProfileNewClick" />
+                            <Button Content="Rename" MinWidth="138" Click="OnProfileRenameClick" />
+                            <Button Content="Duplicate" MinWidth="138" Click="OnProfileDuplicateClick" />
+                            <Button Content="Delete" MinWidth="138" Click="OnProfileDeleteClick" />
+                            <Button Content="Save to profile" MinWidth="138" Click="OnProfileSaveClick" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="Profile hotkey:" VerticalAlignment="Center" />
+                            <ComboBox x:Name="ProfileHotkeyCombo" Width="110" />
+                            <TextBlock Text="Target app:" VerticalAlignment="Center" />
+                            <TextBox x:Name="TargetProcessBox" Width="140" />
+                        </StackPanel>
+                        <CheckBox x:Name="AutoSwitchCheck" Content="Auto-switch by target app" />
+                    </StackPanel>
+                </Expander>
+
+                <!-- Run options -->
+                <Expander x:Name="RunOptionsExpander" HorizontalContentAlignment="Left" Header="Run options" HorizontalAlignment="Stretch">
+                    <Grid ColumnSpacing="8" RowSpacing="6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Start after" VerticalAlignment="Center" />
+                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                            <NumberBox x:Name="StartDelayBox" Width="96" Minimum="0" Maximum="300" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                            <TextBlock Text="seconds (0 = immediately)" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Stop after" VerticalAlignment="Center" />
+                        <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                            <NumberBox x:Name="MaxRunSecondsBox" Width="96" Minimum="0" Maximum="86400" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                            <TextBlock Text="seconds (0 = unlimited)" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="and after" VerticalAlignment="Center" />
+                        <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                            <NumberBox x:Name="MaxActionsBox" Width="96" Minimum="0" Maximum="1000000" SmallChange="1" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                            <TextBlock Text="actions (0 = unlimited)" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <CheckBox x:Name="PanicKeyCheck" Grid.Row="3" Grid.Column="0" Content="Panic key stops the run" VerticalAlignment="Center" />
+                        <Button x:Name="PanicKeyButton" Grid.Row="3" Grid.Column="1" Content="Panic key: Esc" HorizontalAlignment="Left" Click="OnRebindPanicKeyClick" />
+
+                        <CheckBox x:Name="CornerFailSafeCheck" Grid.Row="4" Grid.ColumnSpan="2" Content="Corner fail-safe (cursor in a screen corner stops the run)" />
+                        <CheckBox x:Name="StopOnMouseMoveCheck" Grid.Row="5" Grid.ColumnSpan="2" Content="Stop when I move the mouse" />
+                        <CheckBox x:Name="MinimizeToTrayCheck" Grid.Row="6" Grid.ColumnSpan="2" Content="Minimize to tray" />
+                        <CheckBox x:Name="RunLoggingCheck" Grid.Row="7" Grid.ColumnSpan="2" Content="Write a per-step run log (JSONL)" />
+
+                        <Button Grid.Row="8" Grid.Column="0" Content="Schedule&#x2026;" HorizontalAlignment="Left" Click="OnScheduleClick" />
+
+                        <TextBlock Grid.Row="9" Grid.Column="0" Text="Color mode" VerticalAlignment="Center" />
+                        <StackPanel Grid.Row="9" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                            <ComboBox x:Name="ColorModeCombo" Width="180">
+                                <ComboBoxItem Content="Light (classic)" />
+                                <ComboBoxItem Content="Dark" />
+                                <ComboBoxItem Content="Follow system" />
+                            </ComboBox>
+                            <TextBlock Text="applies on next launch" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="10" Grid.Column="0" Text="Playback speed" VerticalAlignment="Center" />
+                        <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                            <NumberBox x:Name="SpeedBox" Width="96" Minimum="25" Maximum="400" SmallChange="5" SpinButtonPlacementMode="Compact" VerticalAlignment="Center" />
+                            <TextBlock Text="% of recorded timing (100 = as recorded, 200 = twice as fast)" TextWrapping="Wrap" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <CheckBox x:Name="RestoreCursorCheck" Grid.Row="11" Grid.ColumnSpan="2" Content="Restore mouse position when the run ends" />
+                    </Grid>
+                </Expander>
+
+                <!-- Start / Stop (50% split, 50px tall, bold) -->
+                <Grid ColumnSpacing="6" Margin="0,4,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button
+                        x:Name="StartButton"
+                        Grid.Column="0"
+                        Content="Start (F6)"
+                        Height="50"
+                        HorizontalAlignment="Stretch"
+                        FontWeight="Bold"
+                        FontSize="15"
+                        Click="OnStartClick" />
+                    <Button
+                        x:Name="StopRunButton"
+                        Grid.Column="1"
+                        Content="Stop (F6)"
+                        Height="50"
+                        HorizontalAlignment="Stretch"
+                        FontWeight="Bold"
+                        FontSize="15"
+                        IsEnabled="False"
+                        Click="OnStopClick" />
+                </Grid>
+
+                <Button x:Name="HotkeyButton" Content="Hotkey setting" Height="36" HorizontalAlignment="Stretch" Click="OnHotkeyClick" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- ===== Row 2: status row (spring message + compact state / count / waits / timer) ===== -->
+        <Grid
+            Grid.Row="2"
+            Padding="12,6"
+            ColumnSpacing="10"
+            Background="{ThemeResource SubtleFillColorSecondaryBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock
+                x:Name="StatusText"
+                Grid.Column="0"
+                Text="Ready. Press F6 to start/stop."
+                VerticalAlignment="Center"
+                TextTrimming="CharacterEllipsis"
+                TextWrapping="NoWrap" />
+            <TextBlock Grid.Column="1" Text="|" Opacity="0.4" VerticalAlignment="Center" />
+            <TextBlock x:Name="StateText" Grid.Column="2" Text="Ready" VerticalAlignment="Center" />
+            <TextBlock Grid.Column="3" Text="|" Opacity="0.4" VerticalAlignment="Center" />
+            <TextBlock x:Name="ActionCountText" Grid.Column="4" Text="0 actions" VerticalAlignment="Center" />
+            <TextBlock Grid.Column="5" Text="|" Opacity="0.4" VerticalAlignment="Center" />
+            <TextBlock x:Name="WaitTotalText" Grid.Column="6" Text="waits &#x03A3; 0 ms" VerticalAlignment="Center" />
+            <TextBlock Grid.Column="7" Text="|" Opacity="0.4" VerticalAlignment="Center" />
+            <TextBlock x:Name="RunTimerText" Grid.Column="8" Text="00:00" VerticalAlignment="Center" />
+        </Grid>
     </Grid>
 </Window>
+
