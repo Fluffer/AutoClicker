@@ -26,7 +26,13 @@ param(
     [string]$Subject = 'CN=Peter Eg, O=PETER EG, L=Singapore, C=SG',
 
     # When set, pack the MSIX but skip signing entirely (e.g. CI, which has no cert).
-    [switch]$SkipSign
+    [switch]$SkipSign,
+
+    # Root to search recursively for makeappx.exe/signtool.exe (x64). Empty = the stock
+    # Windows SDK location. Point it at an extracted Microsoft.Windows.SDK.BuildTools
+    # NuGet package (bin\) when the full SDK isn't installed — no admin rights needed:
+    #   -SdkBin "$env:LOCALAPPDATA\winsdk-buildtools\bin"
+    [string]$SdkBin = $env:WINSDK_BIN
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,9 +87,16 @@ $publisher = $publisherMatch.Groups[1].Value
 Write-Host "==> Manifest publisher: $publisher"
 
 # --- locate Windows SDK tools (fail fast if missing) ---
-$sdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin'
+if (-not $SdkBin) {
+    $SdkBin = 'C:\Program Files (x86)\Windows Kits\10\bin'
+    # Fall back to the per-user NuGet BuildTools extraction (see the -SdkBin param docs)
+    # so a machine without the full Windows SDK can still package.
+    $nugetTools = Join-Path $env:LOCALAPPDATA 'winsdk-buildtools\bin'
+    if (-not (Test-Path $SdkBin) -and (Test-Path $nugetTools)) { $SdkBin = $nugetTools }
+}
+$sdkBin = $SdkBin
 if (-not (Test-Path $sdkBin)) {
-    throw "Windows SDK not found at '$sdkBin'. Install the Windows 10/11 SDK (makeappx + signtool)."
+    throw "Windows SDK not found at '$sdkBin'. Install the Windows 10/11 SDK (makeappx + signtool) or extract Microsoft.Windows.SDK.BuildTools and pass -SdkBin <path-to-bin>."
 }
 $makeappx = Get-ChildItem $sdkBin -Recurse -Filter makeappx.exe | ? FullName -match 'x64' | sort FullName -desc | select -first 1 -exp FullName
 $signtool = Get-ChildItem $sdkBin -Recurse -Filter signtool.exe | ? FullName -match 'x64' | sort FullName -desc | select -first 1 -exp FullName
