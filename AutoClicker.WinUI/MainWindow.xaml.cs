@@ -22,9 +22,9 @@ namespace AutoClicker.WinUI;
 /// core path — record, run/stop/pause/step, list mutations, save/load, the pick countdown
 /// and global-hotkey delivery — and (M2b2) profile management, the start/stop and panic
 /// rebind dialogs, and target-app auto-switching. The M3 dialogs — the action editor,
-/// find &amp; replace and the two schedule dialogs — are ported too; only the schedule
-/// FIRE path (ScheduleWatcher) is WinForms-only until the WinUI entry point learns the
-/// CLI's --run/--profile arguments.
+/// find &amp; replace and the two schedule dialogs — are ported too, including the
+/// schedule FIRE path (ScheduleWatcher), so scheduled runs launch the same way they do
+/// in WinForms.
 /// </summary>
 /// <remarks>
 /// Row order mirrors <c>Form1.BuildUi</c>: toolbar, then the sections (interval, options +
@@ -149,6 +149,7 @@ public sealed partial class MainWindow : Window, IDisposable
     // The single modeless Find & Replace window (WinForms' findReplaceForm / F7-Ctrl+F).
     // One instance only; Ctrl+F and the context menu refocus it when it already exists.
     private FindReplaceDialog? _findReplace;
+    private ScheduleWatcher? _scheduleWatcher;
 
     // WinUI allows exactly ONE ContentDialog at a time: a second concurrent ShowAsync does not
     // throw a catchable managed exception, it faults inside Microsoft.UI.Xaml.dll (verified:
@@ -177,6 +178,17 @@ public sealed partial class MainWindow : Window, IDisposable
         _recordRed = RecordButton.Foreground; // "#D13438" from the XAML
 
         _settings = AppSettings.Load();
+
+        // Form1/Program.cs apply ColorMode before the window is shown (Application.SetColorMode).
+        // WinUI has no equivalent global call, so the same 0/1/2 mapping is applied to the root
+        // element's RequestedTheme here: 0 = Light (classic), 1 = Dark, 2 = Follow system
+        // (ElementTheme.Default). "applies on next launch" matches the WinForms behaviour.
+        Root.RequestedTheme = _settings.ColorMode switch
+        {
+            1 => ElementTheme.Dark,
+            2 => ElementTheme.Default,
+            _ => ElementTheme.Light,
+        };
 
         // ---- M2b1: the interactive path's collaborators ----
         // The HWND already exists (WinUI creates the window in the base constructor), so the
@@ -214,6 +226,12 @@ public sealed partial class MainWindow : Window, IDisposable
         _autoSwitchTimer.Interval = TimeSpan.FromMilliseconds(1500);
         _autoSwitchTimer.IsRepeating = true;
         _autoSwitchTimer.Tick += (_, _) => AutoSwitchTick();
+
+        // Form1's schedule fire path (ctor lines ~141-142): the watcher runs on its own
+        // cadence, reloads schedules.json every tick (so dialog edits are picked up without
+        // a restart), and reports through the same marshalled status line.
+        _scheduleWatcher = new ScheduleWatcher(msg => MarshalToUi(() => SetStatus(msg)));
+        _scheduleWatcher.Start();
 
         // Physical pixels: give the first measure pass a realistic width instead of WinUI's
         // default, then let the Loaded pass below replace it with the content's size.
@@ -1783,6 +1801,11 @@ public sealed partial class MainWindow : Window, IDisposable
         _runTimer.Stop();
         _autoSwitchTimer?.Stop();
         _autoSwitchTimer = null;
+
+        // Form1.OnFormClosing (~line 2000): stop the schedule watcher before the window
+        // goes away so a tick can't marshal status into a dead dispatcher.
+        _scheduleWatcher?.Dispose();
+        _scheduleWatcher = null;
 
         // Must run before Join below: if a start-delay countdown is pending, `worker` holds a
         // Thread that was built but never started, and Thread.Join throws on one of those.

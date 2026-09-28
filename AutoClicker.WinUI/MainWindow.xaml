@@ -23,7 +23,7 @@
                                                    (WinUI has no AutoSize: see sizing
                                                     code in MainWindow.xaml.cs)
     -->
-    <Grid x:Name="Root">
+    <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />

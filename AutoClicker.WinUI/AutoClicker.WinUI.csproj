@@ -57,4 +57,19 @@
     <ProjectReference Include="..\AutoClicker.Core\AutoClicker.Core.csproj" />
   </ItemGroup>
 
+  <Target Name="CopyXamlArtifactsToPublish" AfterTargets="Publish">
+    <!-- dotnet publish drops the XAML compiler outputs: without App.xbf / MainWindow.xbf
+         and the app's AutoClicker.WinUI.pri, the self-contained bundle crashes in
+         Microsoft.UI.Xaml.dll on startup (APPCRASH 0xc000027b, found in M4 packaging QA).
+         The build produces them in OutputPath before Publish runs, so copy them across. -->
+    <ItemGroup>
+      <_XamlArtifacts Include="$(OutputPath)*.xbf" />
+      <_XamlArtifacts Include="$(OutputPath)AutoClicker.WinUI.pri" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_XamlArtifacts)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('%(Identity)')" />
+  </Target>
+
 </Project>
